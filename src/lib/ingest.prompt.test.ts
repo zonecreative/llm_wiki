@@ -9,6 +9,7 @@ import {
   splitSourceIntoSemanticChunks,
 } from "./ingest"
 import { useWikiStore } from "@/stores/wiki-store"
+import { parseHeadingTree } from "@/lib/heading-parser"
 
 beforeEach(() => {
   useWikiStore.getState().setOutputLanguage("auto")
@@ -205,3 +206,106 @@ describe("long-source ingest planning", () => {
     expect(chunks[1].main.startsWith(chunks[0].main.slice(-200))).toBe(false)
   })
 })
+
+// ── Heading-aware ingest strategy prompts ────────────────────────
+
+describe("buildAnalysisPrompt — ingest strategy hints", () => {
+  it("includes encyclopedia hint when strategy is encyclopedia", () => {
+    const prompt = buildAnalysisPrompt("", "", "content", "encyclopedia")
+    expect(prompt).toContain("Encyclopedia")
+    expect(prompt).toContain("autonomous entry")
+  })
+
+  it("includes narrative hint when strategy is narrative", () => {
+    const prompt = buildAnalysisPrompt("", "", "content", "narrative")
+    expect(prompt).toContain("Narrative")
+    expect(prompt).toContain("NOT entities")
+    expect(prompt).toContain("chapter")
+  })
+
+  it("omits strategy hint for fixed strategy", () => {
+    const prompt = buildAnalysisPrompt("", "", "content", "fixed")
+    expect(prompt).not.toContain("Encyclopedia")
+    expect(prompt).not.toContain("Narrative")
+  })
+
+  it("omits strategy hint when strategy is undefined", () => {
+    const prompt = buildAnalysisPrompt("", "", "content")
+    expect(prompt).not.toContain("Encyclopedia")
+    expect(prompt).not.toContain("Narrative")
+  })
+})
+
+describe("buildGenerationPrompt — encyclopedia mode", () => {
+  it("includes heading tree and one-FILE-block-per-heading instruction", () => {
+    const headingTree = parseHeadingTreeForTest()
+    const prompt = buildGenerationPrompt(
+      "", "", "", "source.md", "", "content", undefined,
+      "encyclopedia", headingTree,
+    )
+    expect(prompt).toContain("Encyclopedia Mode")
+    expect(prompt).toContain("EXACTLY ONE FILE block")
+    expect(prompt).toContain("parent")
+    expect(prompt).toContain("ancestor")
+    expect(prompt).toContain("heading_level")
+    expect(prompt).toContain("heading_path")
+    expect(prompt).toContain("ingest_strategy: encyclopedia")
+    // Heading titles from the tree should appear in the prompt
+    expect(prompt).toContain("Cultura")
+    expect(prompt).toContain("Rituali")
+  })
+
+  it("omits encyclopedia section when headingTree is empty", () => {
+    const prompt = buildGenerationPrompt(
+      "", "", "", "source.md", "", "content", undefined,
+      "encyclopedia", [],
+    )
+    // Without headings, the strategy section is empty — falls back
+    // to no special instructions (the LLM decides freely).
+    expect(prompt).not.toContain("Encyclopedia Mode")
+  })
+})
+
+describe("buildGenerationPrompt — narrative mode", () => {
+  it("includes narrative rules and chapter exclusion", () => {
+    const prompt = buildGenerationPrompt(
+      "", "", "", "source.md", "", "content", undefined,
+      "narrative", [],
+    )
+    expect(prompt).toContain("Narrative Mode")
+    expect(prompt).toContain("Do NOT create wiki pages for chapters")
+    expect(prompt).toContain("not entities")
+    expect(prompt).toContain("characters, places, events, objects")
+  })
+})
+
+describe("buildGenerationPrompt — fixed/undefined strategy", () => {
+  it("omits strategy section for fixed", () => {
+    const prompt = buildGenerationPrompt(
+      "", "", "", "source.md", "", "content", undefined, "fixed",
+    )
+    expect(prompt).not.toContain("Encyclopedia Mode")
+    expect(prompt).not.toContain("Narrative Mode")
+  })
+
+  it("omits strategy section when undefined", () => {
+    const prompt = buildGenerationPrompt(
+      "", "", "", "source.md", "", "content",
+    )
+    expect(prompt).not.toContain("Encyclopedia Mode")
+    expect(prompt).not.toContain("Narrative Mode")
+  })
+})
+
+// Helper: build a small heading tree for encyclopedia prompt tests
+function parseHeadingTreeForTest() {
+  const content = [
+    "# Nani delle Montagne",
+    "I Nani delle Montagne sono un popolo antico e fiero, abitante di Kélamnkor.",
+    "## Cultura",
+    "La cultura dei Nani delle Montagne è ricca e antica, basata su tradizioni millenarie.",
+    "### Rituali",
+    "I rituali dei Nani sono cerimonie sacre che segnano i momenti importanti della vita.",
+  ].join("\n")
+  return parseHeadingTree(content)
+}

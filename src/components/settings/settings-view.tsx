@@ -15,6 +15,7 @@ import {
   Server,
   Settings,
   FileText,
+  Layers,
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { invoke } from "@tauri-apps/api/core"
@@ -34,6 +35,7 @@ import { EmbeddingSection } from "./sections/embedding-section"
 import { MultimodalSection } from "./sections/multimodal-section"
 import { WebSearchSection } from "./sections/web-search-section"
 import { OutputSection } from "./sections/output-section"
+import { IngestStrategySection } from "./sections/ingest-strategy-section"
 import { InterfaceSection } from "./sections/interface-section"
 import { NetworkSection } from "./sections/network-section"
 import { ScheduledImportSection } from "./sections/scheduled-import-section"
@@ -57,6 +59,7 @@ type CategoryId =
   | "mineru"
   | "api-server"
   | "output"
+  | "ingest-strategy"
   | "interface"
   | "maintenance"
   | "changelog"
@@ -83,6 +86,7 @@ const CATEGORIES: Category[] = [
   { id: "mineru", labelKey: "settings.categories.mineru", icon: FileText },
   { id: "api-server", labelKey: "settings.categories.apiServer", icon: Server },
   { id: "output", labelKey: "settings.categories.output", icon: Languages },
+  { id: "ingest-strategy", labelKey: "settings.categories.ingestStrategy", icon: Layers },
   { id: "interface", labelKey: "settings.categories.interface", icon: Palette },
   { id: "maintenance", labelKey: "settings.categories.maintenance", icon: Wrench },
   { id: "changelog", labelKey: "settings.categories.changelog", icon: History },
@@ -615,6 +619,8 @@ export function SettingsView() {
         return <ApiServerSection draft={draft} setDraft={setDraft} />
       case "output":
         return <OutputSection draft={draft} setDraft={setDraft} />
+      case "ingest-strategy":
+        return <IngestStrategySection />
       case "interface":
         return <InterfaceSection draft={draft} setDraft={setDraft} onThemeChange={applyTheme} />
       case "maintenance":
@@ -686,7 +692,7 @@ export function SettingsView() {
         {/* Global Save bar hidden for sections that persist inline:
             - "llm" saves per-row on every edit (independent per-preset state)
             - "about" has no draft-bound fields */}
-        {active !== "about" && active !== "llm" && (
+        {active !== "about" && active !== "llm" && active !== "ingest-strategy" && (
           <div className="shrink-0 border-t bg-background/80 backdrop-blur px-8 py-3">
             <div className="mx-auto flex max-w-2xl items-center justify-between gap-4">
               <p className={`text-xs ${saveError ? "text-destructive" : "text-muted-foreground"}`}>

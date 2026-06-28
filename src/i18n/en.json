@@ -254,6 +254,7 @@
       "mineru": "MinerU PDF",
       "apiServer": "API + MCP",
       "output": "Output",
+      "ingestStrategy": "Ingest Strategy",
       "interface": "Interface",
       "maintenance": "Maintenance",
       "changelog": "Changelog",
@@ -568,6 +569,22 @@
         "historyLength": "Conversation History Length",
         "historyHint": "Number of prior messages sent to the AI on each request. More = richer context but more tokens.",
         "historyCurrent": "Currently {{count}} messages (about {{turns}} turns)"
+      },
+      "ingestStrategy": {
+        "title": "Ingest Strategy",
+        "description": "Choose how documents are chunked and structured during ingest. Auto classifies each document automatically; the other options force a specific strategy.",
+        "modeAuto": "Auto (recommended)",
+        "modeAutoDesc": "Classify each document automatically. Asks for confirmation when confidence is low.",
+        "modeEncyclopedia": "Encyclopedia Mode",
+        "modeEncyclopediaDesc": "Each heading becomes a wiki node with hierarchical frontmatter. Best for compendiums, wikis, and structured reference docs.",
+        "modeNarrative": "Narrative Mode",
+        "modeNarrativeDesc": "Headings are chapter boundaries, not entities. Extracts characters, places, and events from prose. Best for novels and stories.",
+        "modeFixed": "Fixed Chunks (legacy)",
+        "modeFixedDesc": "Token-window chunking with no heading awareness. The original behavior, preserved as fallback.",
+        "active": "Active",
+        "saved": "Saved.",
+        "lastClassification": "Last classification",
+        "classifiedAs": "Strategy: {{strategy}} ({{confidence}}% confidence)"
       },
       "interface": {
         "title": "Interface",

@@ -254,6 +254,7 @@
       "mineru": "MinerU PDF",
       "apiServer": "API + MCP",
       "output": "输出偏好",
+      "ingestStrategy": "导入策略",
       "interface": "界面",
       "maintenance": "维护",
       "changelog": "更新日志",
@@ -568,6 +569,22 @@
         "historyLength": "对话历史长度",
         "historyHint": "每次请求发给 AI 的历史消息条数。多 = 上下文更完整但更费 token。",
         "historyCurrent": "当前 {{count}} 条消息（约 {{turns}} 轮对话）"
+      },
+      "ingestStrategy": {
+        "title": "导入策略",
+        "description": "选择文档在导入过程中如何分块和结构化。自动模式会自动分类每个文档；其他选项强制使用特定策略。",
+        "modeAuto": "自动（推荐）",
+        "modeAutoDesc": "自动分类每个文档。置信度低时会请求确认。",
+        "modeEncyclopedia": "百科模式",
+        "modeEncyclopediaDesc": "每个标题成为带有层次化 frontmatter 的 wiki 节点。适用于手册、百科和结构化参考文档。",
+        "modeNarrative": "叙事模式",
+        "modeNarrativeDesc": "标题是章节边界，不是实体。从散文中提取角色、地点和事件。适用于小说和故事。",
+        "modeFixed": "固定分块（传统）",
+        "modeFixedDesc": "基于 token 窗口的分块，无标题感知。原始行为，保留为后备方案。",
+        "active": "已激活",
+        "saved": "已保存。",
+        "lastClassification": "上次分类",
+        "classifiedAs": "策略：{{strategy}}（{{confidence}}% 置信度）"
       },
       "interface": {
         "title": "界面",

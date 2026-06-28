@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, RotateCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
@@ -17,6 +17,8 @@ import {
   enqueueSourceIngest,
   importSourceFiles,
   importSourceFolder,
+  forceReingestSource,
+  forceReingestAllSources,
 } from "@/lib/source-lifecycle"
 
 const SOURCE_TREE_INITIAL_ROWS = 160
@@ -49,6 +51,8 @@ export function SourcesView() {
    *      anchored here is the right scope.
    */
   const [pendingDeletePath, setPendingDeletePath] = useState<string | null>(null)
+  const [reingestingAll, setReingestingAll] = useState(false)
+  const [showReingestAllConfirm, setShowReingestAllConfirm] = useState(false)
 
   // Auto-disarm: 5 seconds without a second click resets the
   // pending state. Prevents a stale armed button from firing if
@@ -256,6 +260,36 @@ export function SourcesView() {
     }
   }
 
+  async function handleForceReingest(node: FileNode) {
+    if (!project || ingestingPath) return
+    // Force re-ingest clears the cache entry for this source and
+    // re-runs the full pipeline. Used when the user wants to apply
+    // a new ingest strategy or re-process after a pipeline fix.
+    setIngestingPath(node.path)
+    try {
+      await forceReingestSource(project, [node.path], llmConfig)
+    } catch (err) {
+      console.error("Failed to force re-ingest:", err)
+    } finally {
+      setIngestingPath(null)
+    }
+  }
+
+  async function handleReingestAll() {
+    if (!project || reingestingAll) return
+    // The confirmation dialog was already shown by the caller; this
+    // function runs after the user confirmed.
+    setReingestingAll(true)
+    try {
+      await forceReingestAllSources(project, llmConfig)
+    } catch (err) {
+      console.error("Failed to re-ingest all sources:", err)
+    } finally {
+      setReingestingAll(false)
+      setShowReingestAllConfirm(false)
+    }
+  }
+
   return (
     <TooltipProvider delay={300}>
       <div className="flex h-full flex-col">
@@ -286,9 +320,23 @@ export function SourcesView() {
           </Button>
           <Button size="sm" onClick={handleImportFolder} disabled={importing}>
             <Plus className="mr-1 h-4 w-4" />
-            {t("sources.importFolder", "Folder")}
+            {importing ? t("sources.importing") : t("sources.importFolder", "Folder")}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setShowReingestAllConfirm(true)}
+            disabled={!project || reingestingAll || sources.length === 0}
+            className="text-xs"
+            title={t("sources.reingestAllTooltip", { defaultValue: "Force re-ingest of ALL source files. Clears the ingest cache and re-runs the full pipeline for every file." })}
+          >
+            <RotateCw className={`mr-1 h-3.5 w-3.5 ${reingestingAll ? "animate-spin" : ""}`} />
+            {reingestingAll
+              ? t("sources.reingesting", { defaultValue: "Re-ingesting..." })
+              : t("sources.reingestAll", { defaultValue: "Re-ingest All" })}
           </Button>
         </div>
+      </div>
       </div>
 
       <ScrollArea className="min-h-0 flex-1 overflow-hidden">
@@ -321,6 +369,7 @@ export function SourcesView() {
               nodes={sources}
               onOpen={handleOpenSource}
               onIngest={handleIngest}
+              onForceReingest={handleForceReingest}
               onDelete={handleDelete}
               onDeleteFolder={handleDeleteFolder}
               pendingDeletePath={pendingDeletePath}
@@ -353,7 +402,54 @@ export function SourcesView() {
           </TooltipContent>
         </Tooltip>
       </div>
-      </div>
+
+      {showReingestAllConfirm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+          onClick={() => setShowReingestAllConfirm(false)}
+        >
+          <div
+            className="mx-4 max-w-md rounded-lg border border-border bg-background p-6 shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center gap-2">
+              <RotateCw className="h-5 w-5 text-primary" />
+              <h3 className="text-lg font-semibold">
+                {t("sources.reingestAllTitle", { defaultValue: "Re-ingest All Sources" })}
+              </h3>
+            </div>
+            <p className="mb-4 text-sm text-muted-foreground">
+              {t("sources.reingestAllConfirm", {
+                defaultValue:
+                  "This will clear the ingest cache for ALL source files and re-run the full ingest pipeline. " +
+                  "This may take a long time and will use LLM tokens for every file. " +
+                  "Wiki pages will be merged with existing content. Continue?",
+              })}
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setShowReingestAllConfirm(false)}>
+                {t("sources.cancel", { defaultValue: "Cancel" })}
+              </Button>
+              <Button
+                onClick={handleReingestAll}
+                disabled={reingestingAll}
+              >
+                {reingestingAll ? (
+                  <>
+                    <RotateCw className="mr-1.5 h-4 w-4 animate-spin" />
+                    {t("sources.reingesting", { defaultValue: "Re-ingesting..." })}
+                  </>
+                ) : (
+                  <>
+                    <RotateCw className="mr-1.5 h-4 w-4" />
+                    {t("sources.reingestAll", { defaultValue: "Re-ingest All" })}
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </TooltipProvider>
   )
 }
@@ -414,6 +510,7 @@ function SourceTree({
   nodes,
   onOpen,
   onIngest,
+  onForceReingest,
   onDelete,
   onDeleteFolder,
   pendingDeletePath,
@@ -423,6 +520,7 @@ function SourceTree({
   nodes: FileNode[]
   onOpen: (node: FileNode) => void
   onIngest: (node: FileNode) => void
+  onForceReingest: (node: FileNode) => void
   onDelete: (node: FileNode) => void
   onDeleteFolder: (node: FileNode) => void
   /** Path of the node currently in "click again to confirm" state.
@@ -543,12 +641,22 @@ function SourceTree({
             <Button
               variant="ghost"
               size="icon"
-              className="h-7 w-7 shrink-0"
+              className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
               title={t("sources.ingest")}
               disabled={ingestingPath === node.path}
               onClick={() => onIngest(node)}
             >
               <BookOpen className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
+              title={t("sources.forceReingest", { defaultValue: "Force Re-ingest (clear cache + re-run)" })}
+              disabled={ingestingPath === node.path}
+              onClick={() => onForceReingest(node)}
+            >
+              <RotateCw className="h-4 w-4" />
             </Button>
             <DeleteButton
               isPending={isPendingDelete}

@@ -57,17 +57,24 @@ async function saveCache(projectPath: string, cache: CacheData): Promise<void> {
  * blindly, which surfaced ghost entries in the activity panel — clicking
  * them gave the preview panel a missing file, and the auto-save path then
  * materialized a `[Binary file: ...]` stub at the now-empty location.
+ *
+ * When `ingestStrategy` is provided, it is mixed into the hash so that
+ * changing strategy (e.g. from fixed to encyclopedia) invalidates the
+ * cache and triggers a full re-ingest with the new strategy.
  */
 export async function checkIngestCache(
   projectPath: string,
   sourceFileName: string,
   sourceContent: string,
+  ingestStrategy?: string,
 ): Promise<string[] | null> {
   const cache = await loadCache(projectPath)
   const entry = cache.entries[sourceFileName]
   if (!entry) return null
 
-  const currentHash = await sha256(sourceContent)
+  const currentHash = await sha256(
+    ingestStrategy ? `${ingestStrategy}\n${sourceContent}` : sourceContent,
+  )
   if (entry.hash !== currentHash) return null
 
   const pp = normalizePath(projectPath)
@@ -94,15 +101,22 @@ export async function checkIngestCache(
 
 /**
  * Save ingest result to cache after successful ingest.
+ *
+ * When `ingestStrategy` is provided, it is mixed into the hash so the
+ * cache entry is tied to the strategy used. A future ingest with a
+ * different strategy will produce a different hash and miss.
  */
 export async function saveIngestCache(
   projectPath: string,
   sourceFileName: string,
   sourceContent: string,
   filesWritten: string[],
+  ingestStrategy?: string,
 ): Promise<void> {
   const cache = await loadCache(projectPath)
-  const hash = await sha256(sourceContent)
+  const hash = await sha256(
+    ingestStrategy ? `${ingestStrategy}\n${sourceContent}` : sourceContent,
+  )
   const newEntries = { ...cache.entries }
   newEntries[sourceFileName] = {
     hash,

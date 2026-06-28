@@ -273,7 +273,16 @@ function detectLatinLanguage(text: string): string | null {
     if (/\b(und|der|die|das|ist)\b/.test(lower)) return "German"
   }
 
-  // French — common patterns
+  // Italian — must run BEFORE French because Italian shares several
+  // short words with French (`le`, `la`, `de`, `est`) and French
+  // accent chars (é in Kélamnkor) can appear in Italian fantasy text.
+  // The disambiguator is uniquely-Italian words: `gli`, `che`, `della`.
+  if (/\b(il|lo|la|gli|le|di|del|della|è|e|un|una|che|non|per)\b/.test(lower)) {
+    if (/\b(gli|che|della|sono|dei|degli)\b/.test(lower)) return "Italian"
+  }
+
+  // French — common patterns (checked after Italian so Italian text
+  // with shared short words doesn't fall through here)
   if (/[àâçéèêëïîôùûüÿœæ]/.test(lower) || /\b(le|la|les|de|des|est|et|un|une|du|au)\b/.test(lower)) {
     if (/\b(le|la|les|est|une|des)\b/.test(lower)) return "French"
   }
@@ -289,11 +298,6 @@ function detectLatinLanguage(text: string): string | null {
   // (words NOT shared with Portuguese): del/por/las/ñ-bearing/inverted-punct.
   if (/[áéíóúñ¿¡]/.test(lower) || /\b(el|la|los|las|de|del|es|en|por|que|un|una)\b/.test(lower)) {
     if (/\b(el|los|las|del|por)\b/.test(lower) || /[ñ¿¡]/.test(lower)) return "Spanish"
-  }
-
-  // Italian — common patterns
-  if (/\b(il|lo|la|gli|le|di|del|della|è|e|un|una|che|non|per)\b/.test(lower)) {
-    if (/\b(il|della|gli|che|è)\b/.test(lower)) return "Italian"
   }
 
   // Dutch — common patterns

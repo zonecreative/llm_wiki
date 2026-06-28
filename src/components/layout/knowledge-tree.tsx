@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react"
 import {
-  FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, TrendingUp, Target, ChevronRight, ChevronDown, Layout, Globe, Trash2,
+  FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, TrendingUp, Target, ChevronRight, ChevronDown, Layout, Globe, Trash2, RotateCw,
 } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Button } from "@/components/ui/button"
@@ -10,6 +10,9 @@ import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 import { cascadeDeleteWikiPagesWithRefs } from "@/lib/wiki-page-delete"
 import { inferWikiTypeFromPath, wikiTypeLabel } from "@/lib/wiki-page-types"
+import { forceReingestSource, forceReingestAllSources } from "@/lib/source-lifecycle"
+import { hasUsableLlm } from "@/lib/has-usable-llm"
+import { useActivityStore } from "@/stores/activity-store"
 
 interface WikiPageInfo {
   path: string
@@ -17,6 +20,7 @@ interface WikiPageInfo {
   type: string
   tags: string[]
   origin?: string
+  sources?: string[]
 }
 
 const TYPE_CONFIG: Record<string, { icon: typeof FileText; label: string; color: string; order: number }> = {
@@ -38,6 +42,7 @@ function typeConfig(type: string): { icon: typeof FileText; label: string; color
 
 export function KnowledgeTree() {
   const project = useWikiStore((s) => s.project)
+  const llmConfig = useWikiStore((s) => s.llmConfig)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
   const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
@@ -50,6 +55,7 @@ export function KnowledgeTree() {
   // Only one row armed at a time (clicking another row replaces).
   const [armedPath, setArmedPath] = useState<string | null>(null)
   const [deletingPath, setDeletingPath] = useState<string | null>(null)
+  const [ingestingPath, setIngestingPath] = useState<string | null>(null)
 
   const loadPages = useCallback(async () => {
     if (!project) return
@@ -118,6 +124,77 @@ export function KnowledgeTree() {
       }
     },
     [project, armedPath, loadPages, selectedFile, setSelectedFile, setFileTree, bumpDataVersion],
+  )
+
+  const handleReingestSource = useCallback(
+    async (pagePath: string, page: WikiPageInfo) => {
+      if (!project || ingestingPath) return
+      const activity = useActivityStore.getState()
+      const pp = normalizePath(project.path)
+
+      // Resolve the raw source file path from the page's frontmatter
+      // `sources` field. The source identity is stored as a relative
+      // path under raw/sources/.
+      let sourcePath: string | undefined
+      if (page.sources && page.sources.length > 0) {
+        sourcePath = `${pp}/raw/sources/${page.sources[0]}`
+      }
+
+      console.log(`[KnowledgeTree] re-ingest requested for "${page.title}"`, {
+        pagePath,
+        sourcePath,
+        sources: page.sources,
+        llmReady: hasUsableLlm(llmConfig),
+      })
+
+      if (!sourcePath) {
+        console.warn(`[KnowledgeTree] no source path found in frontmatter for "${page.title}"`)
+        window.alert(
+          `Cannot re-ingest "${page.title}": no source file reference found in the page's frontmatter.\n\n` +
+          `This page may have been created manually or its frontmatter \`sources\` field is missing.`,
+        )
+        return
+      }
+
+      if (!hasUsableLlm(llmConfig)) {
+        console.warn(`[KnowledgeTree] LLM not configured — cannot re-ingest`)
+        window.alert(
+          `Cannot re-ingest "${page.title}": no LLM is configured.\n\n` +
+          `Go to Settings → LLM Models to configure an API key or local model.`,
+        )
+        return
+      }
+
+      // Add an activity item immediately so the user sees feedback
+      // even before the queue picks up the task.
+      const activityId = activity.addItem({
+        type: "ingest",
+        title: `Re-ingest: ${page.title}`,
+        status: "running",
+        detail: "Clearing cache and queuing...",
+        filesWritten: [],
+      })
+
+      setIngestingPath(pagePath)
+      try {
+        await forceReingestSource(project, [sourcePath], llmConfig)
+        activity.updateItem(activityId, {
+          detail: "Queued for re-ingest. Check the activity panel for progress.",
+          status: "done",
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.error("[KnowledgeTree] re-ingest failed:", err)
+        activity.updateItem(activityId, {
+          status: "error",
+          detail: `Re-ingest failed: ${msg}`,
+        })
+        window.alert(`Re-ingest failed for "${page.title}": ${msg}`)
+      } finally {
+        setIngestingPath(null)
+      }
+    },
+    [project, ingestingPath, llmConfig],
   )
 
   if (!project) {
@@ -212,6 +289,25 @@ export function KnowledgeTree() {
                           {page.origin === "web-clip" && <Globe className="h-3 w-3 shrink-0 text-blue-400" />}
                           <span className="truncate">{page.title}</span>
                         </button>
+                        {page.type === "source" && page.sources && page.sources.length > 0 && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className={`h-6 w-6 shrink-0 text-muted-foreground hover:text-primary transition-opacity ${
+                              ingestingPath === page.path
+                                ? "opacity-100"
+                                : "opacity-0 group-hover:opacity-100"
+                            }`}
+                            disabled={ingestingPath === page.path}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              void handleReingestSource(page.path, page)
+                            }}
+                            title="Force re-ingest (clear cache + re-run)"
+                          >
+                            <RotateCw className={`h-3 w-3 ${ingestingPath === page.path ? "animate-spin" : ""}`} />
+                          </Button>
+                        )}
                         <DeleteButton
                           armed={isArmed}
                           deleting={isDeleting}
@@ -244,10 +340,14 @@ export function KnowledgeTree() {
 
 function RawSourcesSection() {
   const project = useWikiStore((s) => s.project)
+  const llmConfig = useWikiStore((s) => s.llmConfig)
   const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const [expanded, setExpanded] = useState(false)
   const [sources, setSources] = useState<FileNode[]>([])
+  const [ingestingPath, setIngestingPath] = useState<string | null>(null)
+  const [reingestingAll, setReingestingAll] = useState(false)
+  const [showReingestConfirm, setShowReingestConfirm] = useState(false)
 
   useEffect(() => {
     if (!project) return
@@ -259,39 +359,136 @@ function RawSourcesSection() {
 
   if (sources.length === 0) return null
 
+  const llmReady = hasUsableLlm(llmConfig)
+
+  async function handleReingestOne(file: FileNode) {
+    if (!project || ingestingPath || !llmReady) return
+    setIngestingPath(file.path)
+    try {
+      await forceReingestSource(project, [file.path], llmConfig)
+    } catch (err) {
+      console.error("[RawSources] re-ingest failed:", err)
+    } finally {
+      setIngestingPath(null)
+    }
+  }
+
+  async function handleReingestAll() {
+    if (!project || reingestingAll || !llmReady) return
+    setReingestingAll(true)
+    setShowReingestConfirm(false)
+    try {
+      await forceReingestAllSources(project, llmConfig)
+    } catch (err) {
+      console.error("[RawSources] re-ingest all failed:", err)
+    } finally {
+      setReingestingAll(false)
+    }
+  }
+
   return (
     <div className="mt-2 border-t pt-2">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50"
-      >
-        {expanded ? (
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        ) : (
-          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-sm hover:bg-accent/50"
+        >
+          {expanded ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          )}
+          <BookOpen className="h-3.5 w-3.5 shrink-0 text-amber-600" />
+          <span className="flex-1 text-left font-medium text-muted-foreground">Raw Sources</span>
+          <span className="text-xs text-muted-foreground">{sources.length}</span>
+        </button>
+        {llmReady && sources.length > 0 && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-primary"
+            disabled={reingestingAll}
+            onClick={() => setShowReingestConfirm(true)}
+            title="Re-ingest All (clear cache + re-run)"
+          >
+            <RotateCw className={`h-3 w-3 ${reingestingAll ? "animate-spin" : ""}`} />
+          </Button>
         )}
-        <BookOpen className="h-3.5 w-3.5 shrink-0 text-amber-600" />
-        <span className="flex-1 text-left font-medium text-muted-foreground">Raw Sources</span>
-        <span className="text-xs text-muted-foreground">{sources.length}</span>
-      </button>
+      </div>
       {expanded && (
         <div className="ml-3">
           {sources.map((file) => {
             const isSelected = selectedFile === file.path
+            const isIngesting = ingestingPath === file.path
             return (
-              <button
+              <div
                 key={file.path}
-                onClick={() => openPathInPreview(file.path)}
-                className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm ${
-                  isSelected
-                    ? "bg-accent text-accent-foreground"
-                    : "text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
+                className={`group flex items-center gap-1 rounded-md ${
+                  isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
                 }`}
               >
-                <span className="truncate">{file.name}</span>
-              </button>
+                <button
+                  onClick={() => openPathInPreview(file.path)}
+                  className={`flex flex-1 items-center gap-1.5 px-2 py-1 text-left text-sm min-w-0 ${
+                    isSelected
+                      ? "text-accent-foreground"
+                      : "text-muted-foreground group-hover:text-accent-foreground"
+                  }`}
+                  title={file.path}
+                >
+                  <span className="truncate">{file.name}</span>
+                </button>
+                {llmReady && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={`h-6 w-6 shrink-0 text-muted-foreground hover:text-primary transition-opacity ${
+                      isIngesting ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                    }`}
+                    disabled={isIngesting}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      void handleReingestOne(file)
+                    }}
+                    title="Force re-ingest (clear cache + re-run)"
+                  >
+                    <RotateCw className={`h-3 w-3 ${isIngesting ? "animate-spin" : ""}`} />
+                  </Button>
+                )}
+              </div>
             )
           })}
+        </div>
+      )}
+
+      {showReingestConfirm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+          onClick={() => setShowReingestConfirm(false)}
+        >
+          <div
+            className="mx-4 max-w-md rounded-lg border border-border bg-background p-6 shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center gap-2">
+              <RotateCw className="h-5 w-5 text-primary" />
+              <h3 className="text-lg font-semibold">Re-ingest All Sources</h3>
+            </div>
+            <p className="mb-4 text-sm text-muted-foreground">
+              This will clear the ingest cache for ALL {sources.length} source files and re-run
+              the full ingest pipeline. This may take a long time and will use LLM tokens for
+              every file. Wiki pages will be merged with existing content. Continue?
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setShowReingestConfirm(false)}>
+                Cancel
+              </Button>
+              <Button onClick={handleReingestAll} disabled={reingestingAll}>
+                <RotateCw className={`mr-1.5 h-4 w-4 ${reingestingAll ? "animate-spin" : ""}`} />
+                {reingestingAll ? "Re-ingesting..." : "Re-ingest All"}
+              </Button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -303,6 +500,7 @@ function parsePageInfo(path: string, fileName: string, content: string): WikiPag
   let title = fileName.replace(".md", "").replace(/-/g, " ")
   const tags: string[] = []
   let origin: string | undefined
+  let sources: string[] | undefined
 
   // Parse YAML frontmatter
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---/)
@@ -321,6 +519,14 @@ function parsePageInfo(path: string, fileName: string, content: string): WikiPag
 
     const originMatch = fm.match(/^origin:\s*(.+)$/m)
     if (originMatch) origin = originMatch[1].trim()
+
+    const sourcesMatch = fm.match(/^sources:\s*\[(.+?)\]/m)
+    if (sourcesMatch) {
+      sources = sourcesMatch[1]
+        .split(",")
+        .map((s) => s.trim().replace(/["']/g, ""))
+        .filter(Boolean)
+    }
   }
 
   // Fallback: try first heading if no frontmatter title
@@ -334,7 +540,7 @@ function parsePageInfo(path: string, fileName: string, content: string): WikiPag
     type = inferWikiTypeFromPath(path, fileName) ?? "other"
   }
 
-  return { path, title, type, tags, origin }
+  return { path, title, type, tags, origin, sources }
 }
 
 /**

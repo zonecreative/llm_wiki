@@ -192,6 +192,12 @@ const readingTemplate: WikiTemplate = {
   description: "Track a book's characters, themes, plot threads, and chapter notes",
   icon: "📚",
   extraDirs: ["wiki/characters", "wiki/themes", "wiki/plot-threads", "wiki/chapters"],
+  // This template pairs naturally with the "Narrative Mode" ingest
+  // strategy (Settings → Ingest Strategy). Narrative mode detects
+  // chapter-like headings automatically and instructs the LLM to
+  // extract characters/places/events rather than creating chapter
+  // wiki pages — the custom types below (character, theme,
+  // plot-thread, chapter) give those extracted entities a home.
   schema: `# Wiki Schema — Reading a Book
 
 ## Page Types

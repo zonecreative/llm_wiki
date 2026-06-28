@@ -1,6 +1,8 @@
 import { create } from "zustand"
 import type { WikiProject, FileNode } from "@/types/wiki"
 import { DEFAULT_SOURCE_WATCH_CONFIG } from "@/lib/source-watch-config"
+import type { IngestStrategyConfig } from "@/types/ingest"
+import { DEFAULT_INGEST_STRATEGY_CONFIG } from "@/types/ingest"
 
 /**
  * Wire protocol used when `provider === "custom"`. Other providers have a
@@ -336,6 +338,7 @@ interface WikiState {
   mineruConfig: MineruConfig
   apiConfig: ApiConfig
   generalConfig: GeneralConfig
+  ingestStrategyConfig: IngestStrategyConfig
   dataVersion: number
 
   setProject: (project: WikiProject | null) => void
@@ -360,6 +363,7 @@ interface WikiState {
   setMineruConfig: (config: MineruConfig) => void
   setApiConfig: (config: ApiConfig) => void
   setGeneralConfig: (config: GeneralConfig) => void
+  setIngestStrategyConfig: (config: IngestStrategyConfig) => void
   bumpDataVersion: () => void
 }
 
@@ -483,6 +487,8 @@ export const useWikiStore = create<WikiState>((set) => ({
     closeBehavior: "minimize",
   },
 
+  ingestStrategyConfig: DEFAULT_INGEST_STRATEGY_CONFIG,
+
   setLlmConfig: (llmConfig) => set({ llmConfig }),
   setProviderConfigs: (providerConfigs) => set({ providerConfigs }),
   setActivePresetId: (activePresetId) => set({ activePresetId }),
@@ -496,6 +502,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   setMineruConfig: (mineruConfig) => set({ mineruConfig }),
   setApiConfig: (apiConfig) => set({ apiConfig }),
   setGeneralConfig: (generalConfig) => set({ generalConfig }),
+  setIngestStrategyConfig: (ingestStrategyConfig) => set({ ingestStrategyConfig }),
   bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),
 }))
 

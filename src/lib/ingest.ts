@@ -39,6 +39,9 @@ import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pip
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
+import { heuristicClassify } from "@/lib/document-classifier"
+import { parseHeadingTree, countEncyclopediaEntries, filterEntriesWithContent } from "@/lib/heading-parser"
+import type { IngestStrategy, ClassificationResult, HeadingNode } from "@/types/ingest"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
@@ -195,6 +198,10 @@ interface LongSourceCheckpoint {
   globalDigest: string
   analyses: string[]
   updatedAt: number
+  /** Ingest strategy used when the checkpoint was created. Checkpoints
+   *  from a different strategy are rejected → re-ingest. Undefined on
+   *  pre-feature checkpoints (also rejected → safe re-ingest). */
+  ingestStrategy?: string
 }
 
 /**
@@ -547,6 +554,65 @@ async function autoIngestImpl(
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
 
+  // ── Heading-aware ingest strategy classification ──
+  //
+  // Determines whether the document is an encyclopedia (heading =
+  // wiki node), a narrative (heading = chapter boundary), or falls
+  // back to fixed chunks. The user can override this in Settings →
+  // Ingest Strategy. When mode is "auto" and confidence < threshold,
+  // a confirmation dialog (Level 4) asks the user to confirm.
+  //
+  // The resolved strategy feeds into:
+  //   1. The cache key (so changing strategy re-ingests)
+  //   2. The analysis + generation prompts (mode-specific hints)
+  //   3. The long-source checkpoint validity
+  //   4. Post-generation drift check (encyclopedia: FILE blocks vs headings)
+  const ingestStrategyConfig = useWikiStore.getState().ingestStrategyConfig
+  let ingestStrategy: IngestStrategy = "fixed"
+  let classification: ClassificationResult | undefined
+  let headingTree: HeadingNode[] = []
+
+  if (ingestStrategyConfig.mode === "auto") {
+    classification = heuristicClassify(sourceContent)
+    if (classification.requiresUserConfirmation) {
+      // Low confidence — ask the user (Level 4). The dialog is only
+      // shown in a browser/window context; in headless/CI it falls
+      // back to the classifier's best guess.
+      try {
+        const { promptIngestStrategy } = await import("@/lib/ingest-strategy-dialog")
+        ingestStrategy = await promptIngestStrategy(classification, fileName)
+      } catch {
+        ingestStrategy = classification.strategy
+      }
+    } else {
+      ingestStrategy = classification.strategy
+    }
+    // Persist the last classification so the UI can display reasoning
+    useWikiStore.getState().setIngestStrategyConfig({
+      ...ingestStrategyConfig,
+      lastClassification: classification,
+    })
+  } else {
+    ingestStrategy = ingestStrategyConfig.mode
+  }
+
+  // Pre-parse the heading tree for encyclopedia mode. The generation
+  // prompt uses these as guaranteed boundaries (one FILE block per heading).
+  if (ingestStrategy === "encyclopedia") {
+    headingTree = parseHeadingTree(sourceContent)
+    const entryCount = countEncyclopediaEntries(headingTree, 1)
+    console.log(
+      `[ingest:strategy] encyclopedia mode — ${headingTree.length} headings parsed, ${entryCount} entries (>= H2)`,
+    )
+  } else if (ingestStrategy === "narrative") {
+    headingTree = parseHeadingTree(sourceContent, "narrative-boundary")
+    console.log(
+      `[ingest:strategy] narrative mode — ${headingTree.length} chapter boundaries detected`,
+    )
+  } else {
+    console.log(`[ingest:strategy] ${ingestStrategy} mode (no heading parsing)`)
+  }
+
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   //
   // Image cascade still runs on cache hits. Reason: a user may have
@@ -557,7 +623,7 @@ async function autoIngestImpl(
   // re-running them costs only the extraction time and converges the
   // source-summary page on the current pipeline's contract regardless
   // of when the file was first ingested.
-  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent)
+  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent, ingestStrategy)
   console.log(`[ingest:diag] cache check for "${sourceIdentity}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
     try {
@@ -786,6 +852,7 @@ async function autoIngestImpl(
       sourceBudget,
       activityId,
       signal,
+      ingestStrategy,
     )
     if (longSourcePlan.chunked) {
       sourceContext = longSourcePlan.sourceContext
@@ -809,7 +876,7 @@ async function autoIngestImpl(
     await streamChat(
       llmConfig,
       [
-        { role: "system", content: buildAnalysisPrompt(purpose, index, sourceContext) },
+        { role: "system", content: buildAnalysisPrompt(purpose, index, sourceContext, ingestStrategy) },
         { role: "user", content: `Analyze this source document:\n\n**File:** ${sourceIdentity}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${sourceContext}` },
       ],
       {
@@ -841,7 +908,7 @@ async function autoIngestImpl(
   await streamChat(
     llmConfig,
     [
-      { role: "system", content: buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, sourceContext, sourceSummaryPath) },
+      { role: "system", content: buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, sourceContext, sourceSummaryPath, ingestStrategy, headingTree) },
       {
         role: "user",
         content: [
@@ -948,6 +1015,30 @@ async function autoIngestImpl(
   const writtenPaths = writeResult.writtenPaths
   const writeWarnings = writeResult.warnings
   const hardFailures = writeResult.hardFailures
+
+  // ── Post-generation drift check (encyclopedia mode) ────────────
+  // Compares the number of concept/entity pages generated against the
+  // number of heading entries available. If the LLM ignored the
+  // "one FILE block per heading" instruction and produced significantly
+  // fewer pages, surface a warning so the user knows entries are missing.
+  if (ingestStrategy === "encyclopedia" && headingTree.length > 0) {
+    const expectedEntries = countEncyclopediaEntries(headingTree, 1)
+    const conceptPaths = writtenPaths.filter((p) =>
+      p.startsWith("wiki/concepts/") || p.startsWith("wiki/entities/"),
+    )
+    const driftRatio = expectedEntries > 0
+      ? conceptPaths.length / expectedEntries
+      : 1
+    if (driftRatio < 0.9) {
+      const msg = `Encyclopedia mode drift: generated ${conceptPaths.length} concept/entity pages but ${expectedEntries} headings were available (${Math.round(driftRatio * 100)}% coverage). Some entries may be missing.`
+      console.warn(`[ingest:strategy] ${msg}`)
+      writeWarnings.push(msg)
+    } else {
+      console.log(
+        `[ingest:strategy] encyclopedia drift check OK: ${conceptPaths.length}/${expectedEntries} entries (${Math.round(driftRatio * 100)}%)`,
+      )
+    }
+  }
 
   const aggregateRepairPaths = aggregatePathsNeedingRepair(writtenPaths, writeWarnings)
   const repairableAggregatePaths = aggregateRepairPaths.filter((path) =>
@@ -1115,7 +1206,7 @@ async function autoIngestImpl(
   // — they represent deterministic decisions and caching them is
   // safe.
   if (writtenPaths.length > 0 && hardFailures.length === 0) {
-    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)
+    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, ingestStrategy)
     if (longSourceCheckpointPath) {
       await clearLongSourceCheckpoint(longSourceCheckpointPath)
     }
@@ -1741,15 +1832,146 @@ function shouldRunDedicatedReviewStage(generation: string): boolean {
 }
 
 /**
+ * Build the strategy-specific hint section for the analysis prompt.
+ * Tells the LLM what kind of document it's looking at so it can focus
+ * its analysis accordingly.
+ */
+function buildAnalysisStrategyHint(strategy: IngestStrategy): string {
+  switch (strategy) {
+    case "encyclopedia":
+      return [
+        "## Document Type: Encyclopedia",
+        "This document is a structured reference (compendium, wiki, glossary, or manual).",
+        "Each heading delimits an autonomous entry. When analyzing:",
+        "- Identify each heading as a potential wiki entity/concept",
+        "- Note the hierarchical relationship between headings (parent → child)",
+        "- Focus on extracting definitional content, not narrative progression",
+      ].join("\n")
+    case "narrative":
+      return [
+        "## Document Type: Narrative",
+        "This document is a story, novel, or sequential prose with chapter divisions.",
+        "Headings are chapter titles — they are temporal context, NOT entities.",
+        "When analyzing:",
+        "- Extract characters, places, events, and objects from the prose",
+        "- Note first appearances, relationships, and character development",
+        "- Track plot progression and timeline, but do NOT treat chapters as entities",
+        "- Link extracted entities to existing wiki pages where possible",
+      ].join("\n")
+    default:
+      return ""
+  }
+}
+
+/**
+ * Build the strategy-specific instructions for the generation prompt.
+ *
+ * - Encyclopedia: provides the pre-parsed heading tree and instructs
+ *   the LLM to emit exactly one FILE block per heading (≥ minLevel),
+ *   with hierarchical frontmatter (parent, ancestor, heading_level,
+ *   heading_path, ingest_strategy).
+ * - Narrative: instructs the LLM NOT to create wiki pages for chapters,
+ *   only for extracted entities (characters, places, events, objects).
+ * - Fixed/undefined: no strategy section (legacy behavior).
+ */
+function buildGenerationStrategySection(
+  strategy?: IngestStrategy,
+  headingTree?: HeadingNode[],
+): string {
+  if (!strategy || strategy === "fixed") return ""
+
+  if (strategy === "encyclopedia" && headingTree && headingTree.length > 0) {
+    const { entries, context } = filterEntriesWithContent(headingTree, 1)
+    if (entries.length === 0) return ""
+
+    const entryList = entries.map((h) =>
+      `- Level ${h.level}: "${h.title}" (path: ${h.headingPath.join(" > ")})`,
+    ).join("\n")
+    const contextList = context.length > 0
+      ? context.map((h) =>
+          `- Level ${h.level}: "${h.title}" (path: ${h.headingPath.join(" > ")})`,
+        ).join("\n")
+      : ""
+
+    return [
+      "## Ingest Strategy: Encyclopedia Mode",
+      "",
+      "This document is a structured reference. The headings below have been",
+      "pre-parsed into two categories:",
+      "",
+      "### Entries (create a wiki page for EACH of these)",
+      "These headings have enough body text to warrant a dedicated wiki page.",
+      "You MUST emit EXACTLY ONE FILE block for each entry listed below.",
+      "This includes H1 headings that have real content — they are top-level",
+      "sections, not just a document title.",
+      "",
+      "For each encyclopedia entry FILE block:",
+      '- Path: `wiki/concepts/<kebab-case-slug>.md` (or schema-defined directory)',
+      "- Frontmatter MUST include these additional fields:",
+      "  - `parent`: slug of the parent heading's wiki page (use null if the parent",
+      "    is a context-only heading or a top-level heading)",
+      "  - `ancestor`: slug of the nearest H1 ancestor's wiki page (or null if",
+      "    this entry IS an H1)",
+      "  - `heading_level`: the heading level (1, 2, 3, ...)",
+      "  - `heading_path`: array of heading titles from root to this entry",
+      "    (INCLUDES context-only headings — they provide structural context)",
+      "  - `ingest_strategy: encyclopedia`",
+      "- Body: the heading's content, reorganized as a coherent wiki page",
+      "",
+      `Entries (${entries.length}):`,
+      entryList,
+      context.length > 0 ? "" : undefined,
+      context.length > 0 ? "### Context-only headings (do NOT create pages for these)" : undefined,
+      context.length > 0 ? "These headings exist only to organize their children. Do NOT create" : undefined,
+      context.length > 0 ? "wiki pages for them. Their titles still appear in the `heading_path`" : undefined,
+      context.length > 0 ? "of their children to provide structural context." : undefined,
+      context.length > 0 ? "" : undefined,
+      context.length > 0 ? `Context headings (${context.length}):` : undefined,
+      context.length > 0 ? contextList : undefined,
+    ].filter((line) => line !== undefined).join("\n")
+  }
+
+  if (strategy === "narrative") {
+    return [
+      "## Ingest Strategy: Narrative Mode",
+      "",
+      "This document is narrative prose (novel, story). The headings are chapter",
+      "titles — they are CONTEXT ONLY, not entities.",
+      "",
+      "CRITICAL RULES:",
+      "1. Do NOT create wiki pages for chapters. No `wiki/chapters/` pages.",
+      "2. Do NOT use chapter titles as entity names.",
+      "3. Extract ONLY entities from the prose: characters, places, events, objects.",
+      "4. For each extracted entity, create or update its wiki page.",
+      "5. Use the chapter title as temporal context in the analysis, not as a title.",
+      "6. Link extracted entities to existing wiki pages where possible.",
+      "7. Note first appearances and relationships in entity pages.",
+    ].join("\n")
+  }
+
+  return ""
+}
+
+/**
  * Step 1 prompt: AI reads the source and produces a structured analysis.
  * This is the "discussion" step — the AI reasons about the source before writing wiki pages.
  */
-export function buildAnalysisPrompt(purpose: string, index: string, sourceContent: string = ""): string {
+export function buildAnalysisPrompt(
+  purpose: string,
+  index: string,
+  sourceContent: string = "",
+  ingestStrategy?: IngestStrategy,
+): string {
+  const strategyHint = ingestStrategy
+    ? buildAnalysisStrategyHint(ingestStrategy)
+    : ""
   return [
     "You are an expert research analyst. Read the source document and produce a structured analysis.",
     "Do not output chain-of-thought, hidden reasoning, or a thinking transcript. Reason internally and write only the concise final analysis.",
     "",
     languageRule(sourceContent),
+    "",
+    strategyHint,
     "",
     "Your analysis should cover:",
     "",
@@ -1804,6 +2026,8 @@ export function buildGenerationPrompt(
   overview?: string,
   sourceContent: string = "",
   sourceSummaryPath?: string,
+  ingestStrategy?: IngestStrategy,
+  headingTree?: HeadingNode[],
 ): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
@@ -1893,6 +2117,8 @@ export function buildGenerationPrompt(
     "- Derive filenames from the page title in the mandatory output language, but short proper nouns and technical identifiers take precedence: preserve names such as OpenAI, GPT-5, Transformer, CLIP, ImageNet, PyTorch, CUDA, GitHub, arXiv, React, LanceDB, AnyTXT, MinerU, model names, dataset names, tool names, and code identifiers in their standard original form. Do not put raw URLs, citation strings, or full paper titles directly into file paths; convert surrounding descriptive prose to a safe readable title. For Chinese/Japanese/Korean prose titles, keep readable CJK characters in the filename instead of translating the slug to English.",
     "- Follow the analysis recommendations on what to emphasize",
     "- If the analysis found connections to existing pages, add cross-references",
+    "",
+    buildGenerationStrategySection(ingestStrategy, headingTree),
     "",
     "## Review block types",
     "",
@@ -2293,6 +2519,7 @@ function isCompatibleLongSourceCheckpoint(
     targetChars: number
     overlapChars: number
     chunkTotal: number
+    ingestStrategy: string
   },
 ): boolean {
   return checkpoint.version === 1
@@ -2307,6 +2534,7 @@ function isCompatibleLongSourceCheckpoint(
     && checkpoint.completedThrough <= params.chunkTotal
     && Array.isArray(checkpoint.analyses)
     && checkpoint.analyses.length === checkpoint.completedThrough
+    && checkpoint.ingestStrategy === params.ingestStrategy
 }
 
 async function loadLongSourceCheckpoint(
@@ -2420,6 +2648,7 @@ async function analyzeLongSourceInChunks(
   sourceBudget: number,
   activityId: string,
   signal?: AbortSignal,
+  ingestStrategy: string = "fixed",
 ): Promise<LongSourcePlan> {
   const targetChars = clampNumber(Math.floor(sourceBudget * 0.55), LONG_SOURCE_CHUNK_MIN, LONG_SOURCE_CHUNK_MAX)
   const overlapChars = clampNumber(Math.floor(targetChars * 0.08), 800, 3_000)
@@ -2440,6 +2669,7 @@ async function analyzeLongSourceInChunks(
     targetChars,
     overlapChars,
     chunkTotal: chunks.length,
+    ingestStrategy,
   }
   const checkpoint = await loadLongSourceCheckpoint(checkpointPath, checkpointParams)
   let globalDigest = checkpoint?.globalDigest ?? ""

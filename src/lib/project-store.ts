@@ -1,6 +1,7 @@
 import { load } from "@tauri-apps/plugin-store"
 import type { WikiProject } from "@/types/wiki"
 import type { ApiConfig, GeneralConfig, LlmConfig, SearchApiConfig, EmbeddingConfig, MineruConfig, MultimodalConfig, OutputLanguage, ProviderConfigs, ProxyConfig, ScheduledImportConfig, SourceWatchConfig } from "@/stores/wiki-store"
+import type { IngestStrategyConfig } from "@/types/ingest"
 import { normalizeSourceWatchConfig } from "@/lib/source-watch-config"
 import { normalizePath } from "@/lib/path-utils"
 import { DEFAULT_ZOOM_LEVEL, clampZoomLevel } from "@/stores/zoom-store"
@@ -401,4 +402,19 @@ export async function loadZoomLevel(): Promise<number> {
   const store = await getStore()
   const level = await store.get<number>(ZOOM_LEVEL_KEY)
   return normalizeZoomLevel(level)
+}
+
+const INGEST_STRATEGY_KEY = "ingestStrategyConfig"
+
+export async function saveIngestStrategyConfig(
+  config: IngestStrategyConfig,
+): Promise<void> {
+  const store = await getStore()
+  await store.set(INGEST_STRATEGY_KEY, config)
+  await store.save()
+}
+
+export async function loadIngestStrategyConfig(): Promise<IngestStrategyConfig | null> {
+  const store = await getStore()
+  return (await store.get<IngestStrategyConfig>(INGEST_STRATEGY_KEY)) ?? null
 }

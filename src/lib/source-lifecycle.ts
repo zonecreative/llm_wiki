@@ -528,3 +528,82 @@ function withRootContext(context: string, rootContext?: string): string {
   if (!context) return rootContext
   return `${rootContext} > ${context}`
 }
+
+/**
+ * Force re-ingest of a single source file by clearing its ingest cache
+ * entry and enqueuing it fresh. Used by the "Force Re-ingest" button
+ * in the Sources view when the user wants to re-run the full ingest
+ * pipeline (e.g. after changing the ingest strategy or after a
+ * pipeline bug fix).
+ *
+ * Unlike `enqueueSourceIngest`, this does NOT skip the cache check
+ * inside `autoIngest` — instead it removes the cache entry first, so
+ * the pipeline runs end-to-end as if the file had never been ingested.
+ */
+export async function forceReingestSource(
+  project: WikiProject,
+  sourcePaths: string[],
+  llmConfig: LlmConfig,
+  options: { sourceRoot?: string; rootContext?: string } = {},
+): Promise<string[]> {
+  if (!hasUsableLlm(llmConfig)) return []
+  const pp = normalizePath(project.path)
+
+  // Clear cache entries for every source so autoIngest runs the full
+  // pipeline instead of short-circuiting on a cache hit.
+  for (const sourcePath of sourcePaths) {
+    if (!isIngestableSourcePath(sourcePath)) continue
+    const identity = sourceIdentityForPath(pp, normalizePath(sourcePath))
+    try {
+      await removeFromIngestCache(pp, identity)
+    } catch (err) {
+      console.warn(`[reingest] failed to clear cache for ${identity}:`, err)
+    }
+  }
+
+  // Reuse the standard enqueue path — same folderContext logic, same
+  // queue, same activity panel reporting.
+  return enqueueSourceIngest(project, sourcePaths, llmConfig, options)
+}
+
+/**
+ * Force re-ingest of ALL source files in the project. Collects every
+ * file under raw/sources/, clears all ingest cache entries, and
+ * enqueues them all. Intended for the global "Re-ingest All" button
+ * with a user-confirmation dialog.
+ *
+ * Returns the list of enqueued task IDs (one per source file).
+ */
+export async function forceReingestAllSources(
+  project: WikiProject,
+  llmConfig: LlmConfig,
+): Promise<string[]> {
+  if (!hasUsableLlm(llmConfig)) return []
+  const pp = normalizePath(project.path)
+  const sourcesRoot = `${pp}/raw/sources`
+
+  // Collect every file under raw/sources/ recursively
+  let tree: FileNode[]
+  try {
+    tree = await listDirectory(sourcesRoot)
+  } catch (err) {
+    console.error("[reingest-all] failed to list sources:", err)
+    return []
+  }
+
+  const allFiles: string[] = []
+  for (const node of tree) {
+    for (const f of collectAllFilesIncludingDot(node)) {
+      allFiles.push(normalizePath(f.path))
+    }
+  }
+  if (allFiles.length === 0) return []
+
+  console.log(
+    `[reingest-all] force re-ingesting ${allFiles.length} source file(s)`,
+  )
+
+  return forceReingestSource(project, allFiles, llmConfig, {
+    sourceRoot: sourcesRoot,
+  })
+}
