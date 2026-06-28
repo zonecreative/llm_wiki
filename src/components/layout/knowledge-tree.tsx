@@ -13,6 +13,7 @@ import { inferWikiTypeFromPath, wikiTypeLabel } from "@/lib/wiki-page-types"
 import { forceReingestSource, forceReingestAllSources } from "@/lib/source-lifecycle"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
 import { useActivityStore } from "@/stores/activity-store"
+import { BatchIngestDialog } from "@/components/sources/batch-ingest-dialog"
 
 interface WikiPageInfo {
   path: string
@@ -348,6 +349,7 @@ function RawSourcesSection() {
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
   const [reingestingAll, setReingestingAll] = useState(false)
   const [showReingestConfirm, setShowReingestConfirm] = useState(false)
+  const [showBatchDialog, setShowBatchDialog] = useState(false)
 
   useEffect(() => {
     if (!project) return
@@ -408,8 +410,8 @@ function RawSourcesSection() {
             size="icon"
             className="h-6 w-6 shrink-0 text-muted-foreground hover:text-primary"
             disabled={reingestingAll}
-            onClick={() => setShowReingestConfirm(true)}
-            title="Re-ingest All (clear cache + re-run)"
+            onClick={() => setShowBatchDialog(true)}
+            title="Batch Ingest — set strategy per file, then ingest all"
           >
             <RotateCw className={`h-3 w-3 ${reingestingAll ? "animate-spin" : ""}`} />
           </Button>
@@ -460,6 +462,11 @@ function RawSourcesSection() {
           })}
         </div>
       )}
+
+      <BatchIngestDialog
+        open={showBatchDialog}
+        onClose={() => setShowBatchDialog(false)}
+      />
 
       {showReingestConfirm && (
         <div

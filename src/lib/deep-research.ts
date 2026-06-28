@@ -341,7 +341,7 @@ async function executeResearch(
 
     // Auto-ingest the research result to generate entities, concepts, cross-references
     if (isActiveProjectPath(pp)) {
-      autoIngest(pp, `${pp}/${savedPath}`, llmConfig).catch((err) => {
+      autoIngest(pp, `${pp}/${savedPath}`, llmConfig, undefined, undefined, false).catch((err) => {
         console.error("Failed to auto-ingest research result:", err)
       })
     }

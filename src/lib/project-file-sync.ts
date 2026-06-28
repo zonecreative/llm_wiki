@@ -15,7 +15,6 @@ import type { FileChangeTask } from "@/commands/file-sync"
 import {
   cleanupDeletedWikiPages,
   deleteSourceFiles,
-  enqueueSourceIngest,
   isIngestableSourcePath,
 } from "@/lib/source-lifecycle"
 import { isPathAllowedBySourceWatch, normalizeSourceWatchConfig } from "@/lib/source-watch-config"
@@ -223,9 +222,16 @@ async function enqueueRawSourceChanges(project: WikiProject, tasks: FileChangeTa
   if (paths.length === 0) return
 
   try {
-    await enqueueSourceIngest(project, paths, useWikiStore.getState().llmConfig)
+    // Instead of enqueuing directly, set pendingWatchIngest so the
+    // React app shows the Batch Ingest Dialog. The user sets the
+    // strategy per file, then clicks "Start Batch Ingest" which
+    // enqueues with the correct strategies. This avoids the
+    // unreliable heuristic classifier running silently on watch-
+    // folder files.
+    useWikiStore.getState().setPendingWatchIngest(paths)
+    console.log(`[file-sync] ${paths.length} file(s) pending strategy selection — showing batch dialog`)
   } catch (err) {
-    console.error("[file-sync] failed to enqueue raw source ingest:", err)
+    console.error("[file-sync] failed to set pending watch ingest:", err)
   }
 }
 

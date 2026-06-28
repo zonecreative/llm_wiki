@@ -244,7 +244,7 @@ describe("buildGenerationPrompt — encyclopedia mode", () => {
       "encyclopedia", headingTree,
     )
     expect(prompt).toContain("Encyclopedia Mode")
-    expect(prompt).toContain("EXACTLY ONE FILE block")
+    expect(prompt).toContain("PRE-COMPUTED slug")
     expect(prompt).toContain("parent")
     expect(prompt).toContain("ancestor")
     expect(prompt).toContain("heading_level")
@@ -253,6 +253,8 @@ describe("buildGenerationPrompt — encyclopedia mode", () => {
     // Heading titles from the tree should appear in the prompt
     expect(prompt).toContain("Cultura")
     expect(prompt).toContain("Rituali")
+    // Pre-computed slugs should appear
+    expect(prompt).toContain("nani-delle-montagne-rituali")
   })
 
   it("omits encyclopedia section when headingTree is empty", () => {

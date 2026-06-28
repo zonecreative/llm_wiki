@@ -19,8 +19,35 @@
 APP_PORTS := 19828 19827 1420 5173
 
 help: ## Show available commands
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "  llm_wiki — Development Commands"
+	@echo ""
+	@echo "  Make                          npm                          Description"
+	@echo "  ─────────────────────────────────────────────────────────────────────"
+	@echo "  make help                     —                            Show this help"
+	@echo "  make kill                     npm run kill                 Kill processes on app ports + stale tauri/vite"
+	@echo "  make dev                      npm run tauri dev            Kill stale processes then start tauri dev"
+	@echo "  make clean-dev                npm run dev:clean            Kill + clean caches + start fresh dev"
+	@echo "  make test                     npm run test:mocks           Run all mock tests"
+	@echo "  make test-watch               npm run test:watch           Run tests in watch mode"
+	@echo "  make test-fast FILE=…         —                            Run a specific test file"
+	@echo "  make test-llm                 npm run test:llm             Run real-LLM tests (needs Ollama/API key)"
+	@echo "  make typecheck                npm run typecheck            TypeScript type check"
+	@echo "  make check                    npm run check                Typecheck + tests (run before commit)"
+	@echo "  make clean-caches             —                            Remove ingest cache, checkpoints, graphify data"
+	@echo "  make clean-project-cache      —                            Clean caches for a specific project (PATH=…)"
+	@echo "  make graphify                 —                            Rebuild the knowledge graph"
+	@echo "  make build                    npm run build                Production build (typecheck + vite build)"
+	@echo "  make release                  npm run release              Build release .app + install to /Applications"
+	@echo "  make release-dmg               —                            Build .dmg installer for distribution"
+	@echo "  make install                  npm install                  Install dependencies"
+	@echo "  make mcp-build                npm run mcp:build            Build the MCP server (before tauri dev)"
+	@echo ""
+	@echo "  Tips"
+	@echo "  • Run 'make kill' before 'make dev' if you see 'Address already in use'"
+	@echo "  • Set outputLanguage: Italian in Settings to avoid auto-detect misdetections"
+	@echo "  • Use 'make clean-project-cache PATH=/path/to/project' to force re-ingest of one project"
+	@echo ""
 
 kill: ## Kill processes holding app ports + stale tauri dev
 	@echo "Killing processes on ports: $(APP_PORTS)"
@@ -82,6 +109,40 @@ graphify: ## Rebuild the knowledge graph
 
 build: ## Production build (typecheck + vite build)
 	npm run build
+
+release: ## Build release .app bundle and install to /Applications
+	@echo "Building release .app bundle..."
+	npm run tauri build
+	@echo "Installing to /Applications..."
+	@APP_PATH=$$(find src-tauri/target/release/bundle/macos -name "*.app" -maxdepth 1 2>/dev/null | head -1); \
+	if [ -z "$$APP_PATH" ]; then \
+		echo "ERROR: no .app found in src-tauri/target/release/bundle/macos/"; \
+		echo "Check build output above for errors."; \
+		exit 1; \
+	fi; \
+	APP_NAME=$$(basename "$$APP_PATH"); \
+	echo "Found: $$APP_PATH"; \
+	if [ -d "/Applications/$$APP_NAME" ]; then \
+		echo "Removing old version from /Applications..."; \
+		rm -rf "/Applications/$$APP_NAME"; \
+	fi; \
+	cp -R "$$APP_PATH" /Applications/; \
+	echo ""; \
+	echo "✓ Installed to /Applications/$$APP_NAME"; \
+	echo "  Open with: open /Applications/$$APP_NAME"; \
+	echo "  Or find it in Launchpad / Spotlight"
+
+release-dmg: ## Build release .dmg installer (for distribution)
+	@echo "Building release .dmg installer..."
+	npm run tauri build -- --bundles dmg
+	@DMG_PATH=$$(find src-tauri/target/release/bundle/dmg -name "*.dmg" -maxdepth 1 2>/dev/null | head -1); \
+	if [ -n "$$DMG_PATH" ]; then \
+		echo ""; \
+		echo "✓ DMG created: $$DMG_PATH"; \
+		echo "  Double-click to install, or distribute to others."; \
+	else \
+		echo "No .dmg found — check build output."; \
+	fi
 
 install: ## Install dependencies
 	npm install

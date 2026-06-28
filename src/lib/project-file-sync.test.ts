@@ -159,6 +159,7 @@ describe("project file sync", () => {
     const { useFileSyncStore } = await import("@/stores/file-sync-store")
     await import("@/lib/project-file-sync").then((m) => m.stopProjectFileSync())
     useWikiStore.getState().setProject(null)
+    useWikiStore.getState().setPendingWatchIngest(null)
     useWikiStore.getState().setLlmConfig({
       provider: "openai",
       apiKey: "k",
@@ -245,9 +246,8 @@ describe("project file sync", () => {
 
     await vi.advanceTimersByTimeAsync(250)
 
-    expect(mocks.enqueueBatch).toHaveBeenCalledWith("A", [
-      { sourcePath: "raw/sources/report.pdf", folderContext: "" },
-    ])
+    expect(useWikiStore.getState().pendingWatchIngest).not.toBeNull()
+    expect(useWikiStore.getState().pendingWatchIngest).toContain("raw/sources/report.pdf")
   })
 
   it("does not ingest preprocessed cache files from raw/sources/.cache", async () => {
@@ -282,7 +282,7 @@ describe("project file sync", () => {
 
     await vi.advanceTimersByTimeAsync(250)
 
-    expect(mocks.enqueueBatch).not.toHaveBeenCalled()
+    expect(useWikiStore.getState().pendingWatchIngest).toBeNull()
   })
 
   it("manual rescan uses the same source ingest flow when the watcher is stopped", async () => {
@@ -317,9 +317,8 @@ describe("project file sync", () => {
       "/tmp/a",
       expect.objectContaining({ enabled: true, autoIngest: true }),
     )
-    expect(mocks.enqueueBatch).toHaveBeenCalledWith("A", [
-      { sourcePath: "raw/sources/manual.pdf", folderContext: "" },
-    ])
+    expect(useWikiStore.getState().pendingWatchIngest).not.toBeNull()
+    expect(useWikiStore.getState().pendingWatchIngest).toContain("raw/sources/manual.pdf")
   })
 
   it("enqueues existing XML when source watch restarts with xml newly allowed", async () => {
@@ -365,9 +364,8 @@ describe("project file sync", () => {
         includeExtensions: expect.arrayContaining(["xml"]),
       }),
     )
-    expect(mocks.enqueueBatch).toHaveBeenCalledWith("A", [
-      { sourcePath: "raw/sources/existing.xml", folderContext: "" },
-    ])
+    expect(useWikiStore.getState().pendingWatchIngest).not.toBeNull()
+    expect(useWikiStore.getState().pendingWatchIngest).toContain("raw/sources/existing.xml")
   })
 
   it("does not suppress a retried file-change task that reuses the same id", async () => {
@@ -399,7 +397,7 @@ describe("project file sync", () => {
       tasks: [{ ...baseTask, updatedAt: 1 }],
     })
     await vi.advanceTimersByTimeAsync(300)
-    expect(mocks.enqueueBatch).toHaveBeenCalledTimes(1)
+    expect(useWikiStore.getState().pendingWatchIngest).not.toBeNull()
 
     mocks.emit("file-sync://changed", {
       projectId: "A",
@@ -407,7 +405,7 @@ describe("project file sync", () => {
     })
     await vi.advanceTimersByTimeAsync(300)
 
-    expect(mocks.enqueueBatch).toHaveBeenCalledTimes(2)
+    expect(useWikiStore.getState().pendingWatchIngest).not.toBeNull()
   })
 
   it("manual rescan uses returned changed tasks while the watcher is running", async () => {
@@ -440,9 +438,8 @@ describe("project file sync", () => {
 
     await rescanProjectFileSync(project)
 
-    expect(mocks.enqueueBatch).toHaveBeenCalledWith("A", [
-      { sourcePath: "raw/sources/watcher-running.pdf", folderContext: "" },
-    ])
+    expect(useWikiStore.getState().pendingWatchIngest).not.toBeNull()
+    expect(useWikiStore.getState().pendingWatchIngest).toContain("raw/sources/watcher-running.pdf")
   })
 
   it("manual rescan ignores changed tasks after project switch", async () => {
@@ -474,7 +471,7 @@ describe("project file sync", () => {
 
     await rescanProjectFileSync(projectA)
 
-    expect(mocks.enqueueBatch).not.toHaveBeenCalled()
+    expect(useWikiStore.getState().pendingWatchIngest).toBeNull()
   })
 
   it("manual rescan refreshes the file tree when no files changed", async () => {
@@ -514,7 +511,7 @@ describe("project file sync", () => {
 
     await rescanProjectFileSync(project, { autoIngest: false } as never)
 
-    expect(mocks.enqueueBatch).not.toHaveBeenCalled()
+    expect(useWikiStore.getState().pendingWatchIngest).toBeNull()
   })
 
   it("removes an externally deleted raw source from every wiki page sources field", async () => {

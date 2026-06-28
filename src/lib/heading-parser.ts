@@ -18,6 +18,7 @@
  * Pure & deterministic: same input ⇒ same output. No I/O, no globals.
  */
 import { stripFrontmatter } from "./text-chunker"
+import { makeQuerySlug } from "./wiki-filename"
 import type { HeadingNode, HeadingNodeType } from "@/types/ingest"
 
 /**
@@ -61,6 +62,7 @@ export function parseHeadingTree(
     if (currentLevel > 0) {
       nodes.push({
         headingPath: [...currentHeadingPath],
+        pathKey: currentHeadingPath.join(" > ").toLowerCase(),
         level: currentLevel,
         title: currentTitle,
         content: bodyText,
@@ -162,60 +164,256 @@ const MIN_CONTENT_CHARS = 40
 const DEFAULT_MIN_LEVEL = 1
 
 /**
- * Split a heading tree into:
- *   - `entries`: headings that have enough body text to warrant a wiki page
- *   - `context`: headings that exist only for hierarchy (their title
- *     still appears in children's `heading_path` for context, but no
- *     wiki page is created for them)
+ * How many times a heading title must appear (case-insensitive)
+ * across the document before it's classified as "structural" rather
+ * than "entry". Structural headings are repeated boilerplate fields
+ * like "Danni", "Effetti Collaterali", "Descrizione" that appear
+ * under every spell/weapon/item in a game manual.
  *
- * This is the key quality filter for the encyclopedia strategy: a
- * deeply-structured compendium like the Compendio dei Nani has 4-6
- * levels of headings, but many intermediate levels (e.g. "Storia
- * antica" → "Periodo 1000-1500") have no real text — they exist
- * purely to nest their children. Without this filter, the pipeline
- * would produce dozens of empty stub pages.
+ * Threshold of 3 means: if a title appears 1-2 times it's treated as
+ * a legitimate unique entry; 3+ times it's structural and gets folded
+ * into its parent entry.
+ */
+const STRUCTURAL_FREQUENCY_THRESHOLD = 3
+
+/**
+ * Result of the 3-way heading classification.
+ *
+ * - `entries`: headings that become dedicated wiki pages. They have
+ *   unique titles and enough content (either their own or absorbed
+ *   from folded structural children).
+ * - `structural`: headings whose title repeats ≥ threshold times
+ *   across the document. Their content is folded into the nearest
+ *   entry ancestor — they do NOT get their own wiki page.
+ * - `context`: headings with too little content and no structural
+ *   children to fold. They exist only for hierarchy; their title
+ *   appears in children's `heading_path` but no page is created.
+ */
+export interface HeadingClassification {
+  entries: HeadingNode[]
+  structural: HeadingNode[]
+  context: HeadingNode[]
+  /**
+   * For each structural heading, the nearest entry ancestor that
+   * absorbs its content. Key = structural heading path, value =
+   * entry heading path. Undefined when no entry ancestor exists
+   * (structural falls back to becoming an entry itself).
+   */
+  foldMap: Map<string, string | null>
+}
+
+/**
+ * Classify headings into three categories: entries, structural, and
+ * context. This is the core quality filter for the encyclopedia
+ * strategy.
+ *
+ * The classification is **iterative**:
+ *   1. Count title frequencies → mark structural headings (≥ threshold)
+ *   2. Compute "effective content" for each non-structural heading:
+ *      own body + body of all structural descendants
+ *   3. Classify: effective content ≥ minChars → entry; else → context
+ *
+ * Step 2 is the key insight: a heading that was originally "context"
+ * (too little own content) can become an "entry" after absorbing the
+ * content of its structural children. For example:
+ *
+ *   ## Palla di Fuoco        → context ("Una magia di fuoco." = 18 chars)
+ *   ### Danni                → structural (repeated 50×)
+ *   ### Effetti Collaterali  → structural (repeated 50×)
+ *
+ * After folding, "Palla di Fuoco" has 18 + Danni + Effetti chars → entry.
  *
  * @param minLevel Minimum heading level to consider (default 1 = H1).
- *   Use 2 to skip the document title and only process sub-sections.
+ * @param minContentChars Minimum body chars for an entry (default 40).
+ * @param frequencyThreshold How many repetitions make a heading structural (default 3).
  */
-export function filterEntriesWithContent(
+export function classifyHeadings(
   nodes: HeadingNode[],
   minLevel: number = DEFAULT_MIN_LEVEL,
   minContentChars: number = MIN_CONTENT_CHARS,
-): { entries: HeadingNode[]; context: HeadingNode[] } {
+  frequencyThreshold: number = STRUCTURAL_FREQUENCY_THRESHOLD,
+): HeadingClassification {
   const candidates = filterByMinLevel(nodes, minLevel)
+  if (candidates.length === 0) {
+    return { entries: [], structural: [], context: [], foldMap: new Map() }
+  }
+
+  // ── Step 1: count title frequencies (case-insensitive) ──────────
+  const titleCounts = new Map<string, number>()
+  for (const node of candidates) {
+    const key = node.title.toLowerCase().trim()
+    titleCounts.set(key, (titleCounts.get(key) ?? 0) + 1)
+  }
+
+  // ── Step 2: mark structural headings ─────────────────────────────
+  const structuralSet = new Set<string>()
+  for (const node of candidates) {
+    const key = node.title.toLowerCase().trim()
+    if ((titleCounts.get(key) ?? 0) >= frequencyThreshold) {
+      structuralSet.add(node.pathKey)
+    }
+  }
+
+  // ── Step 3: compute effective content for non-structural headings ──
+  // Effective content = own body + sum of structural descendants' bodies.
+  // A "structural descendant" is any structural heading whose headingPath
+  // extends this heading's headingPath (i.e., it's deeper in the same branch).
   const entries: HeadingNode[] = []
+  const structural: HeadingNode[] = []
   const context: HeadingNode[] = []
+  const foldMap = new Map<string, string | null>()
 
   for (const node of candidates) {
-    // "Content" = body text minus the heading line itself. A heading
-    // like "## Cultura\nIntro breve." has ~11 chars of body — too
-    // short. One like "### Rituali\nI rituali dei Nani sono cerimonie..."
-    // has 100+ chars — enough for a wiki page.
-    const bodyText = node.content
-      .replace(/^#{1,6}\s+.+$/m, "") // strip the heading line itself
+    if (structuralSet.has(node.pathKey)) {
+      structural.push(node)
+      // Find nearest entry ancestor (will be resolved in second pass)
+      foldMap.set(node.pathKey, null)
+      continue
+    }
+
+    // Compute effective content: own body + structural descendants
+    const ownBody = node.content
+      .replace(/^#{1,6}\s+.+$/m, "")
       .trim()
 
-    if (bodyText.length >= minContentChars) {
+    let effectiveLen = ownBody.length
+    for (const other of candidates) {
+      if (!structuralSet.has(other.pathKey)) continue
+      if (!isDescendantOf(other, node)) continue
+      const childBody = other.content
+        .replace(/^#{1,6}\s+.+$/m, "")
+        .trim()
+      effectiveLen += childBody.length
+    }
+
+    if (effectiveLen >= minContentChars) {
       entries.push(node)
     } else {
       context.push(node)
     }
   }
 
+  // ── Step 4: resolve fold targets ─────────────────────────────────
+  // For each structural heading, find the nearest entry ancestor.
+  // If no entry ancestor exists, the structural heading becomes an
+  // entry itself (fallback — better to create the page than lose content).
+  const entryPathKeys = new Set(entries.map((e) => e.pathKey))
+
+  for (const node of structural) {
+    let ancestor: HeadingNode | null = null
+    // Walk up the headingPath to find the nearest entry ancestor
+    for (let i = node.headingPath.length - 2; i >= 0; i--) {
+      const ancestorPath = node.headingPath.slice(0, i + 1)
+      const ancestorKey = ancestorPath.join(" > ").toLowerCase()
+      // Find the candidate with this headingPath
+      const found = candidates.find(
+        (c) => c.headingPath.join(" > ").toLowerCase() === ancestorKey,
+      )
+      if (found && entryPathKeys.has(found.pathKey)) {
+        ancestor = found
+        break
+      }
+    }
+
+    if (ancestor) {
+      foldMap.set(node.pathKey, ancestor.pathKey)
+    } else {
+      // No entry ancestor — promote structural to entry
+      foldMap.set(node.pathKey, null)
+      entries.push(node)
+      structural.splice(structural.indexOf(node), 1)
+      entryPathKeys.add(node.pathKey)
+    }
+  }
+
+  return { entries, structural, context, foldMap }
+}
+
+/**
+ * Check if `child` is a descendant of `parent` in the heading tree.
+ * A node is a descendant if its headingPath extends the parent's
+ * headingPath (i.e., parent's path is a prefix of child's path).
+ */
+function isDescendantOf(child: HeadingNode, parent: HeadingNode): boolean {
+  if (child.headingPath.length <= parent.headingPath.length) return false
+  for (let i = 0; i < parent.headingPath.length; i++) {
+    if (child.headingPath[i] !== parent.headingPath[i]) return false
+  }
+  return true
+}
+
+/**
+ * Backward-compatible wrapper around `classifyHeadings` that returns
+ * the old 2-category shape (entries + context). Structural headings
+ * are merged into entries (they were promoted or folded).
+ *
+ * @deprecated Use `classifyHeadings` directly for the 3-category result.
+ */
+export function filterEntriesWithContent(
+  nodes: HeadingNode[],
+  minLevel: number = DEFAULT_MIN_LEVEL,
+  minContentChars: number = MIN_CONTENT_CHARS,
+): { entries: HeadingNode[]; context: HeadingNode[] } {
+  const { entries, context } = classifyHeadings(nodes, minLevel, minContentChars)
   return { entries, context }
 }
 
 /**
  * Count how many heading nodes would become encyclopedia entries
- * (i.e. are at or below `minLevel` AND have enough body text).
- * Convenience for the post-generation drift check that compares
- * FILE blocks produced vs headings available.
+ * (i.e. are at or below `minLevel`, have enough content, and are
+ * not structural). Convenience for the post-generation drift check.
  */
 export function countEncyclopediaEntries(
   nodes: HeadingNode[],
   minLevel: number = DEFAULT_MIN_LEVEL,
   minContentChars: number = MIN_CONTENT_CHARS,
 ): number {
-  return filterEntriesWithContent(nodes, minLevel, minContentChars).entries.length
+  return classifyHeadings(nodes, minLevel, minContentChars).entries.length
+}
+
+/**
+ * Compute the wiki slug for an encyclopedia entry using the
+ * "H1 + leaf" rule: the H1 (top-level ancestor) provides the
+ * namespace, and the leaf heading (this entry's own title) provides
+ * the unique identifier within that namespace.
+ *
+ * Examples:
+ *   headingPath: ["Nani delle Montagne", "Cultura", "Rituali"]
+ *   → slug: "nani-delle-montagne-rituali"
+ *
+ *   headingPath: ["Manuale GDR", "Magie", "Palla di Fuoco"]
+ *   → slug: "manuale-gdr-palla-di-fuoco"
+ *
+ * This rule ensures:
+ *   1. No cross-document collisions (different H1 → different prefix)
+ *   2. No cross-population confusion ("Nani delle Montagne" vs
+ *      "Nani delle Pianure" → different H1 → different slug)
+ *   3. Readable slugs (only 2 segments, not the full hierarchy)
+ *   4. The full hierarchy is preserved in frontmatter `heading_path`,
+ *      `parent`, and `ancestor` — the slug doesn't need to encode it
+ *
+ * @param node The heading node to compute a slug for
+ * @returns kebab-case slug like "nani-delle-montagne-rituali"
+ */
+export function computeEncyclopediaSlug(node: HeadingNode): string {
+  const ancestor = node.headingPath[0] ?? node.title
+  const leaf = node.title
+  const ancestorSlug = makeQuerySlug(ancestor)
+  const leafSlug = makeQuerySlug(leaf)
+  return `${ancestorSlug}-${leafSlug}`
+}
+
+/**
+ * Build a map of entry pathKey → suggested slug for all entries in
+ * a classification. Used by the generation prompt to pre-compute
+ * slugs so the LLM doesn't have to guess (and stays consistent).
+ */
+export function computeEntrySlugs(
+  entries: HeadingNode[],
+): Map<string, string> {
+  const slugs = new Map<string, string>()
+  for (const entry of entries) {
+    slugs.set(entry.pathKey, computeEncyclopediaSlug(entry))
+  }
+  return slugs
 }

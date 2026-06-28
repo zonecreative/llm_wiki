@@ -29,6 +29,9 @@ export type HeadingNodeType = "encyclopedia-entry" | "narrative-boundary"
 export interface HeadingNode {
   /** Full breadcrumb, e.g. ["Nani delle Montagne", "Cultura", "Rituali"]. */
   headingPath: string[]
+  /** Stable key derived from headingPath (lowercase, joined by " > ").
+   *  Used for frequency counting and fold-map lookups. */
+  pathKey: string
   /** Heading level 1..6. */
   level: number
   /** The heading title text (without leading `#`). */
@@ -99,6 +102,14 @@ export interface IngestStrategyConfig {
    * reasoning. Undefined until the first ingest runs.
    */
   lastClassification?: ClassificationResult
+  /**
+   * Per-file strategy overrides. Key = source file name (basename),
+   * value = strategy to use for that file. When a file has an
+   * override, the classifier is skipped entirely and the override
+   * strategy is used directly. This lets the user pre-set strategies
+   * for a batch ingest without monitoring each file.
+   */
+  fileOverrides?: Record<string, IngestStrategy>
 }
 
 /**

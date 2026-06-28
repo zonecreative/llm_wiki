@@ -229,6 +229,7 @@ describe("scanAndImport failure handling", () => {
       project,
       ["/Users/me/wiki-project/raw/sources/scheduled-import/ok.pdf"],
       expect.any(Object),
+      { "interactive": false },
     )
     expect(mocks.writeFileAtomic).toHaveBeenCalled()
   })

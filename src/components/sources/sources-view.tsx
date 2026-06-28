@@ -20,6 +20,7 @@ import {
   forceReingestSource,
   forceReingestAllSources,
 } from "@/lib/source-lifecycle"
+import { BatchIngestDialog } from "./batch-ingest-dialog"
 
 const SOURCE_TREE_INITIAL_ROWS = 160
 const SOURCE_TREE_LOAD_BATCH = 160
@@ -53,6 +54,7 @@ export function SourcesView() {
   const [pendingDeletePath, setPendingDeletePath] = useState<string | null>(null)
   const [reingestingAll, setReingestingAll] = useState(false)
   const [showReingestAllConfirm, setShowReingestAllConfirm] = useState(false)
+  const [showBatchDialog, setShowBatchDialog] = useState(false)
 
   // Auto-disarm: 5 seconds without a second click resets the
   // pending state. Prevents a stale armed button from firing if
@@ -325,15 +327,26 @@ export function SourcesView() {
           <Button
             size="sm"
             variant="outline"
-            onClick={() => setShowReingestAllConfirm(true)}
+            onClick={() => setShowBatchDialog(true)}
+            disabled={!project || sources.length === 0}
+            className="text-xs"
+            title={t("sources.batchIngestTooltip", { defaultValue: "Set strategy per file, then ingest all at once" })}
+          >
+            <RotateCw className="mr-1 h-3.5 w-3.5" />
+            {t("sources.batchIngest", { defaultValue: "Batch Ingest" })}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setShowBatchDialog(true)}
             disabled={!project || reingestingAll || sources.length === 0}
             className="text-xs"
-            title={t("sources.reingestAllTooltip", { defaultValue: "Force re-ingest of ALL source files. Clears the ingest cache and re-runs the full pipeline for every file." })}
+            title={t("sources.batchIngestTooltip", { defaultValue: "Set strategy per file, then ingest all at once — no interruptions" })}
           >
             <RotateCw className={`mr-1 h-3.5 w-3.5 ${reingestingAll ? "animate-spin" : ""}`} />
             {reingestingAll
               ? t("sources.reingesting", { defaultValue: "Re-ingesting..." })
-              : t("sources.reingestAll", { defaultValue: "Re-ingest All" })}
+              : t("sources.batchIngest", { defaultValue: "Batch Ingest" })}
           </Button>
         </div>
       </div>
@@ -402,6 +415,11 @@ export function SourcesView() {
           </TooltipContent>
         </Tooltip>
       </div>
+
+      <BatchIngestDialog
+        open={showBatchDialog}
+        onClose={() => setShowBatchDialog(false)}
+      />
 
       {showReingestAllConfirm && (
         <div

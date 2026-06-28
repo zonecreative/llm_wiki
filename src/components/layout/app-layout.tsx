@@ -8,6 +8,7 @@ import { SidebarPanel } from "./sidebar-panel"
 import { ContentArea } from "./content-area"
 import { ResearchPanel } from "./research-panel"
 import { ActivityPanel } from "./activity-panel"
+import { WatchIngestBridge } from "./watch-ingest-bridge"
 import { useResearchStore } from "@/stores/research-store"
 import { ErrorBoundary } from "@/components/error-boundary"
 import { getAppLayoutVisibility } from "./app-layout-visibility"
@@ -143,6 +144,7 @@ export function AppLayout({ onSwitchProject }: AppLayoutProps) {
           )}
         </div>
       </div>
+      <WatchIngestBridge />
     </div>
   )
 }

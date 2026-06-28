@@ -135,7 +135,7 @@ export async function enqueueSourceIngest(
   project: WikiProject,
   sourcePaths: string[],
   llmConfig: LlmConfig,
-  options: { sourceRoot?: string; rootContext?: string } = {},
+  options: { sourceRoot?: string; rootContext?: string; interactive?: boolean } = {},
 ): Promise<string[]> {
   if (!hasUsableLlm(llmConfig)) return []
   const files = sourcePaths
@@ -148,7 +148,7 @@ export async function enqueueSourceIngest(
       ),
     }))
   if (files.length === 0) return []
-  return enqueueBatch(project.id, files)
+  return enqueueBatch(project.id, files, options.interactive ?? true)
 }
 
 export async function importSourceFiles(

@@ -19,6 +19,10 @@ export interface IngestTask {
   addedAt: number
   error: string | null
   retryCount: number
+  /** Whether the ingest can show interactive dialogs (classification
+   *  confirmation). Set to false for watch-folder / scheduled-import
+   *  tasks where no user is present to answer. Defaults to true. */
+  interactive: boolean
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
@@ -101,6 +105,7 @@ function upsertQueuedIngestTask(
   projectId: string,
   sourcePath: string,
   folderContext: string,
+  interactive: boolean = true,
 ): string {
   if (queue.length === 0 && !processing) {
     resetQueueAccounting()
@@ -147,6 +152,7 @@ function upsertQueuedIngestTask(
     addedAt: Date.now(),
     error: null,
     retryCount: 0,
+    interactive,
   }
   queue.push(task)
   return task.id
@@ -210,6 +216,7 @@ export async function enqueueIngest(
 export async function enqueueBatch(
   projectId: string,
   files: Array<{ sourcePath: string; folderContext: string }>,
+  interactive: boolean = true,
 ): Promise<string[]> {
   if (!currentProjectId || currentProjectId !== projectId) {
     throw new Error(
@@ -219,11 +226,11 @@ export async function enqueueBatch(
 
   const ids: string[] = []
   for (const file of files) {
-    ids.push(upsertQueuedIngestTask(projectId, file.sourcePath, file.folderContext))
+    ids.push(upsertQueuedIngestTask(projectId, file.sourcePath, file.folderContext, interactive))
   }
 
   await saveQueue(currentProjectPath)
-  console.log(`[Ingest Queue] Enqueued ${files.length} files`)
+  console.log(`[Ingest Queue] Enqueued ${files.length} files (interactive: ${interactive})`)
   processNext(currentProjectId)
 
   return ids
@@ -572,7 +579,7 @@ async function processNext(projectId: string): Promise<void> {
   lastWrittenFiles = []
 
   try {
-    const writtenFiles = await autoIngest(pp, fullSourcePath, llmConfig, currentAbortController.signal, next.folderContext)
+    const writtenFiles = await autoIngest(pp, fullSourcePath, llmConfig, currentAbortController.signal, next.folderContext, next.interactive)
     // Stale-context guard: project switched during the long LLM call.
     // Bail without mutating queue or writing to disk — pauseQueue has
     // already persisted the correct state to the old project's file,

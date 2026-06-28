@@ -408,7 +408,7 @@ export async function scanAndImport(
       const destPaths = changedFiles.map((file) => file.destPath)
       await Promise.all(destPaths.map((path) => preprocessFile(path).catch(() => {})))
       if (isCurrentRun(project.id, options.runId)) {
-        const ids = await enqueueSourceIngest(project, destPaths, llmConfig)
+        const ids = await enqueueSourceIngest(project, destPaths, llmConfig, { interactive: false })
         if (ids.length > 0) {
           for (const file of changedFiles) {
             nextDb.files[file.key] = file.md5

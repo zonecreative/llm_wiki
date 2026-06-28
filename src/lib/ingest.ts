@@ -22,7 +22,7 @@ import {
   sourceSummarySlugFromIdentity,
 } from "@/lib/source-identity"
 import { parseSources, writeSources } from "@/lib/sources-merge"
-import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
+import { checkIngestCache, saveIngestCache, INGEST_PIPELINE_VERSION } from "@/lib/ingest-cache"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
 import { mergePageContent, type MergeFn } from "@/lib/page-merge"
 import { withProjectLock } from "@/lib/project-mutex"
@@ -40,7 +40,7 @@ import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
 import { heuristicClassify } from "@/lib/document-classifier"
-import { parseHeadingTree, countEncyclopediaEntries, filterEntriesWithContent } from "@/lib/heading-parser"
+import { parseHeadingTree, countEncyclopediaEntries, classifyHeadings, computeEntrySlugs } from "@/lib/heading-parser"
 import type { IngestStrategy, ClassificationResult, HeadingNode } from "@/types/ingest"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
@@ -202,6 +202,9 @@ interface LongSourceCheckpoint {
    *  from a different strategy are rejected → re-ingest. Undefined on
    *  pre-feature checkpoints (also rejected → safe re-ingest). */
   ingestStrategy?: string
+  /** Pipeline version when the checkpoint was created. Bumps when
+   *  prompt/classification logic changes → old checkpoints rejected. */
+  pipelineVersion?: string
 }
 
 /**
@@ -483,9 +486,10 @@ export async function autoIngest(
   llmConfig: LlmConfig,
   signal?: AbortSignal,
   folderContext?: string,
+  interactive: boolean = true,
 ): Promise<string[]> {
   return withProjectLock(normalizePath(projectPath), () =>
-    autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext),
+    autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext, interactive),
   )
 }
 
@@ -495,6 +499,7 @@ async function autoIngestImpl(
   llmConfig: LlmConfig,
   signal?: AbortSignal,
   folderContext?: string,
+  interactive: boolean = true,
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
@@ -572,12 +577,21 @@ async function autoIngestImpl(
   let classification: ClassificationResult | undefined
   let headingTree: HeadingNode[] = []
 
-  if (ingestStrategyConfig.mode === "auto") {
+  // ── Per-file override check ──
+  // If the user pre-set a strategy for this specific file (via the
+  // batch ingest dialog), use it directly — skip the classifier
+  // and the confirmation dialog entirely.
+  const fileOverride = ingestStrategyConfig.fileOverrides?.[fileName]
+  if (fileOverride) {
+    ingestStrategy = fileOverride
+    console.log(`[ingest:strategy] using per-file override "${fileOverride}" for "${fileName}"`)
+  } else if (ingestStrategyConfig.mode === "auto") {
     classification = heuristicClassify(sourceContent)
-    if (classification.requiresUserConfirmation) {
-      // Low confidence — ask the user (Level 4). The dialog is only
-      // shown in a browser/window context; in headless/CI it falls
-      // back to the classifier's best guess.
+    if (classification.requiresUserConfirmation && interactive) {
+      // Low confidence + interactive context — ask the user (Level 4).
+      // In non-interactive contexts (watch folder, scheduled import,
+      // batch ingest with pre-set overrides), use the classifier's
+      // best guess silently to avoid blocking the queue.
       try {
         const { promptIngestStrategy } = await import("@/lib/ingest-strategy-dialog")
         ingestStrategy = await promptIngestStrategy(classification, fileName)
@@ -585,7 +599,14 @@ async function autoIngestImpl(
         ingestStrategy = classification.strategy
       }
     } else {
+      // Either high confidence (apply directly) or non-interactive
+      // (use best guess without asking).
       ingestStrategy = classification.strategy
+      if (classification.requiresUserConfirmation && !interactive) {
+        console.log(
+          `[ingest:strategy] low confidence (${Math.round(classification.confidence * 100)}%) for "${fileName}" — using ${classification.strategy} silently (non-interactive context)`,
+        )
+      }
     }
     // Persist the last classification so the UI can display reasoning
     useWikiStore.getState().setIngestStrategyConfig({
@@ -1881,14 +1902,56 @@ function buildGenerationStrategySection(
   if (!strategy || strategy === "fixed") return ""
 
   if (strategy === "encyclopedia" && headingTree && headingTree.length > 0) {
-    const { entries, context } = filterEntriesWithContent(headingTree, 1)
-    if (entries.length === 0) return ""
+    const classification = classifyHeadings(headingTree, 1)
+    if (classification.entries.length === 0) return ""
 
-    const entryList = entries.map((h) =>
-      `- Level ${h.level}: "${h.title}" (path: ${h.headingPath.join(" > ")})`,
-    ).join("\n")
-    const contextList = context.length > 0
-      ? context.map((h) =>
+    // Pre-compute slugs so the LLM doesn't have to guess. Each entry
+    // gets a deterministic slug: {H1-slug}-{leaf-slug}. This prevents
+    // cross-document collisions (different H1 → different prefix) and
+    // keeps slugs short (only 2 segments, not the full hierarchy).
+    const entrySlugs = computeEntrySlugs(classification.entries)
+
+    // Build parent → children map for the linking instructions.
+    // An entry's children are other entries whose headingPath extends
+    // this entry's headingPath by exactly one level.
+    const entryByPathKey = new Map(
+      classification.entries.map((e) => [e.pathKey, e]),
+    )
+    const childrenMap = new Map<string, string[]>() // parent pathKey → child slugs
+    for (const entry of classification.entries) {
+      if (entry.headingPath.length < 2) continue
+      const parentPath = entry.headingPath.slice(0, -1)
+      const parentKey = parentPath.join(" > ").toLowerCase()
+      const parentEntry = entryByPathKey.get(parentKey)
+      if (!parentEntry) continue
+      const childSlug = entrySlugs.get(entry.pathKey)!
+      const existing = childrenMap.get(parentEntry.pathKey) ?? []
+      existing.push(childSlug)
+      childrenMap.set(parentEntry.pathKey, existing)
+    }
+
+    const entryList = classification.entries.map((h) => {
+      const slug = entrySlugs.get(h.pathKey)!
+      const children = childrenMap.get(h.pathKey)
+      const childInfo = children && children.length > 0
+        ? ` [children: ${children.join(", ")}]`
+        : ""
+      return `- Slug: "${slug}" | Level ${h.level}: "${h.title}" (path: ${h.headingPath.join(" > ")})${childInfo}`
+    }).join("\n")
+
+    const structuralList = classification.structural.length > 0
+      ? classification.structural.map((h) => {
+          const foldTarget = classification.foldMap.get(h.pathKey)
+          const targetEntry = foldTarget
+            ? classification.entries.find((e) => e.pathKey === foldTarget)
+            : null
+          const targetName = targetEntry?.title ?? "(nearest entry ancestor)"
+          return `- "${h.title}" (path: ${h.headingPath.join(" > ")}) → fold into "${targetName}"`
+        }).join("\n")
+      : ""
+
+    const contextList = classification.context.length > 0
+      ? classification.context.map((h) =>
           `- Level ${h.level}: "${h.title}" (path: ${h.headingPath.join(" > ")})`,
         ).join("\n")
       : ""
@@ -1896,38 +1959,58 @@ function buildGenerationStrategySection(
     return [
       "## Ingest Strategy: Encyclopedia Mode",
       "",
-      "This document is a structured reference. The headings below have been",
-      "pre-parsed into two categories:",
+      "This document is a structured reference. Headings have been pre-parsed",
+      "into three categories. Follow the instructions for each category exactly.",
       "",
       "### Entries (create a wiki page for EACH of these)",
-      "These headings have enough body text to warrant a dedicated wiki page.",
-      "You MUST emit EXACTLY ONE FILE block for each entry listed below.",
-      "This includes H1 headings that have real content — they are top-level",
-      "sections, not just a document title.",
+      "Each entry has a PRE-COMPUTED slug — use it EXACTLY as given for the",
+      "FILE block path. Do not invent your own slug.",
       "",
       "For each encyclopedia entry FILE block:",
-      '- Path: `wiki/concepts/<kebab-case-slug>.md` (or schema-defined directory)',
+      '- Path: `wiki/concepts/<slug>.md` (use the slug from the list below)',
       "- Frontmatter MUST include these additional fields:",
-      "  - `parent`: slug of the parent heading's wiki page (use null if the parent",
-      "    is a context-only heading or a top-level heading)",
-      "  - `ancestor`: slug of the nearest H1 ancestor's wiki page (or null if",
-      "    this entry IS an H1)",
+      "  - `parent`: slug of the parent entry (from the list below), or null",
+      "    if this entry is a top-level (H1) or has no parent entry",
+      "  - `ancestor`: slug of the nearest H1 entry, or null if this IS an H1",
       "  - `heading_level`: the heading level (1, 2, 3, ...)",
       "  - `heading_path`: array of heading titles from root to this entry",
-      "    (INCLUDES context-only headings — they provide structural context)",
+      "    (INCLUDES context-only and structural headings — they provide",
+      "    structural context)",
       "  - `ingest_strategy: encyclopedia`",
-      "- Body: the heading's content, reorganized as a coherent wiki page",
+      "- Body: the heading's content, reorganized as a coherent wiki page.",
+      "  If structural sub-headings were folded into this entry, include",
+      "  their content as clearly labeled ## sections within the page body.",
       "",
-      `Entries (${entries.length}):`,
+      "### Parent-child linking (CRITICAL)",
+      "If an entry has children (listed in [children: ...] above):",
+      "- Include a `## Sub-entries` section in the page body listing all",
+      "  children as `[[child-slug]]` wikilinks with a one-line description",
+      "- This ensures the parent page serves as an index/overview for its",
+      "  children (e.g. a \"Magie\" page links to every individual spell)",
+      "If an entry has a parent entry:",
+      "- Add the parent's slug to the `related` frontmatter field",
+      "- Mention the parent in the body with a `[[parent-slug]]` wikilink",
+      "",
+      `Entries (${classification.entries.length}):`,
       entryList,
-      context.length > 0 ? "" : undefined,
-      context.length > 0 ? "### Context-only headings (do NOT create pages for these)" : undefined,
-      context.length > 0 ? "These headings exist only to organize their children. Do NOT create" : undefined,
-      context.length > 0 ? "wiki pages for them. Their titles still appear in the `heading_path`" : undefined,
-      context.length > 0 ? "of their children to provide structural context." : undefined,
-      context.length > 0 ? "" : undefined,
-      context.length > 0 ? `Context headings (${context.length}):` : undefined,
-      context.length > 0 ? contextList : undefined,
+      classification.structural.length > 0 ? "" : undefined,
+      classification.structural.length > 0 ? "### Structural headings (do NOT create pages for these)" : undefined,
+      classification.structural.length > 0 ? "These headings have titles that repeat across the document (e.g. \"Danni\"," : undefined,
+      classification.structural.length > 0 ? "\"Effetti Collaterali\", \"Descrizione\" — boilerplate fields under every" : undefined,
+      classification.structural.length > 0 ? "spell/item/weapon). Their content has been FOLDED into their parent" : undefined,
+      classification.structural.length > 0 ? "entry. Do NOT create separate wiki pages for them. Instead, include" : undefined,
+      classification.structural.length > 0 ? "their content as sections within the parent entry's wiki page." : undefined,
+      classification.structural.length > 0 ? "" : undefined,
+      classification.structural.length > 0 ? `Structural headings (${classification.structural.length}):` : undefined,
+      classification.structural.length > 0 ? structuralList : undefined,
+      classification.context.length > 0 ? "" : undefined,
+      classification.context.length > 0 ? "### Context-only headings (do NOT create pages for these)" : undefined,
+      classification.context.length > 0 ? "These headings exist only to organize their children. Do NOT create" : undefined,
+      classification.context.length > 0 ? "wiki pages for them. Their titles still appear in the `heading_path`" : undefined,
+      classification.context.length > 0 ? "of their children to provide structural context." : undefined,
+      classification.context.length > 0 ? "" : undefined,
+      classification.context.length > 0 ? `Context headings (${classification.context.length}):` : undefined,
+      classification.context.length > 0 ? contextList : undefined,
     ].filter((line) => line !== undefined).join("\n")
   }
 
@@ -2520,6 +2603,7 @@ function isCompatibleLongSourceCheckpoint(
     overlapChars: number
     chunkTotal: number
     ingestStrategy: string
+    pipelineVersion: string
   },
 ): boolean {
   return checkpoint.version === 1
@@ -2535,6 +2619,7 @@ function isCompatibleLongSourceCheckpoint(
     && Array.isArray(checkpoint.analyses)
     && checkpoint.analyses.length === checkpoint.completedThrough
     && checkpoint.ingestStrategy === params.ingestStrategy
+    && (checkpoint as { pipelineVersion?: string }).pipelineVersion === params.pipelineVersion
 }
 
 async function loadLongSourceCheckpoint(
@@ -2670,6 +2755,7 @@ async function analyzeLongSourceInChunks(
     overlapChars,
     chunkTotal: chunks.length,
     ingestStrategy,
+    pipelineVersion: INGEST_PIPELINE_VERSION,
   }
   const checkpoint = await loadLongSourceCheckpoint(checkpointPath, checkpointParams)
   let globalDigest = checkpoint?.globalDigest ?? ""

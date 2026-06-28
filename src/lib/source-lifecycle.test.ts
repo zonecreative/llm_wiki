@@ -109,7 +109,7 @@ describe("source-lifecycle path helpers", () => {
         sourcePath: "/project/raw/sources/imported/keep.md",
         folderContext: "imported",
       },
-    ])
+    ], true)
   })
 
   it("rejects importing the project folder or folders inside it", async () => {
@@ -179,6 +179,6 @@ describe("source-lifecycle path helpers", () => {
         sourcePath: "/project/raw/sources/ready.md",
         folderContext: "",
       },
-    ])
+    ], true)
   })
 })

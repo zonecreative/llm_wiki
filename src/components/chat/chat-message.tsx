@@ -303,7 +303,7 @@ function SaveToWikiButton({ content, visible }: { content: string; visible: bool
       const llmConfig = useWikiStore.getState().llmConfig
       if (hasUsableLlm(llmConfig)) {
         const { autoIngest } = await import("@/lib/ingest")
-        autoIngest(pp, filePath, llmConfig).catch((err) =>
+        autoIngest(pp, filePath, llmConfig, undefined, undefined, false).catch((err) =>
           console.error("Failed to auto-ingest saved query:", err)
         )
       }

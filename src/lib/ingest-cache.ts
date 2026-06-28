@@ -7,6 +7,22 @@ import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
  * Cache file: .llm-wiki/ingest-cache.json
  */
 
+/**
+ * Pipeline version — bumped when the ingest prompt logic, heading
+ * parser, or classification algorithm changes in a way that would
+ * produce different output for the same input. This is mixed into
+ * the cache hash so old entries auto-invalidate without requiring
+ * the user to manually clear caches.
+ *
+ * Bump this when:
+ *   - The encyclopedia/narrative prompt templates change significantly
+ *   - The heading classification algorithm changes (e.g. new structural
+ *     folding logic, new content threshold)
+ *   - The slug computation rule changes
+ *   - The parent-child linking logic changes
+ */
+export const INGEST_PIPELINE_VERSION = "2"
+
 interface CacheEntry {
   hash: string
   timestamp: number
@@ -23,6 +39,27 @@ async function sha256(content: string): Promise<string> {
   const hashBuffer = await crypto.subtle.digest("SHA-256", data)
   const hashArray = Array.from(new Uint8Array(hashBuffer))
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("")
+}
+
+/**
+ * Compute the cache hash for a source file. Includes:
+ *   - The pipeline version (bumps when prompt/classification logic changes)
+ *   - The ingest strategy (encyclopedia/narrative/fixed)
+ *   - The source content
+ *
+ * This ensures that ANY change to the ingest pipeline invalidates the
+ * cache automatically — the user never needs to manually clear it.
+ */
+async function computeCacheHash(
+  sourceContent: string,
+  ingestStrategy?: string,
+): Promise<string> {
+  const parts = [
+    `v=${INGEST_PIPELINE_VERSION}`,
+    ingestStrategy ? `strategy=${ingestStrategy}` : "",
+    sourceContent,
+  ].filter(Boolean)
+  return sha256(parts.join("\n"))
 }
 
 function cachePath(projectPath: string): string {
@@ -72,9 +109,7 @@ export async function checkIngestCache(
   const entry = cache.entries[sourceFileName]
   if (!entry) return null
 
-  const currentHash = await sha256(
-    ingestStrategy ? `${ingestStrategy}\n${sourceContent}` : sourceContent,
-  )
+  const currentHash = await computeCacheHash(sourceContent, ingestStrategy)
   if (entry.hash !== currentHash) return null
 
   const pp = normalizePath(projectPath)
@@ -114,9 +149,7 @@ export async function saveIngestCache(
   ingestStrategy?: string,
 ): Promise<void> {
   const cache = await loadCache(projectPath)
-  const hash = await sha256(
-    ingestStrategy ? `${ingestStrategy}\n${sourceContent}` : sourceContent,
-  )
+  const hash = await computeCacheHash(sourceContent, ingestStrategy)
   const newEntries = { ...cache.entries }
   newEntries[sourceFileName] = {
     hash,

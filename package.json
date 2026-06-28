@@ -18,7 +18,9 @@
     "dev:clean": "npm run kill && npm run tauri dev",
     "mcp:build": "npm --prefix mcp-server run build",
     "mcp:test": "npm --prefix mcp-server test",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "release": "tauri build",
+    "release:dmg": "tauri build -- --bundles dmg"
   },
   "dependencies": {
     "@base-ui/react": "^1.3.0",

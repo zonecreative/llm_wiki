@@ -339,6 +339,14 @@ interface WikiState {
   apiConfig: ApiConfig
   generalConfig: GeneralConfig
   ingestStrategyConfig: IngestStrategyConfig
+  /**
+   * When the watch folder detects new/modified files, it sets this
+   * to the list of file paths instead of enqueuing directly. The
+   * React app watches this field and shows the Batch Ingest Dialog
+   * so the user can set the strategy per file BEFORE ingest starts.
+   * Cleared when the dialog is closed or the batch is started.
+   */
+  pendingWatchIngest: string[] | null
   dataVersion: number
 
   setProject: (project: WikiProject | null) => void
@@ -364,6 +372,7 @@ interface WikiState {
   setApiConfig: (config: ApiConfig) => void
   setGeneralConfig: (config: GeneralConfig) => void
   setIngestStrategyConfig: (config: IngestStrategyConfig) => void
+  setPendingWatchIngest: (paths: string[] | null) => void
   bumpDataVersion: () => void
 }
 
@@ -489,6 +498,8 @@ export const useWikiStore = create<WikiState>((set) => ({
 
   ingestStrategyConfig: DEFAULT_INGEST_STRATEGY_CONFIG,
 
+  pendingWatchIngest: null,
+
   setLlmConfig: (llmConfig) => set({ llmConfig }),
   setProviderConfigs: (providerConfigs) => set({ providerConfigs }),
   setActivePresetId: (activePresetId) => set({ activePresetId }),
@@ -503,6 +514,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   setApiConfig: (apiConfig) => set({ apiConfig }),
   setGeneralConfig: (generalConfig) => set({ generalConfig }),
   setIngestStrategyConfig: (ingestStrategyConfig) => set({ ingestStrategyConfig }),
+  setPendingWatchIngest: (pendingWatchIngest) => set({ pendingWatchIngest }),
   bumpDataVersion: () => set((state) => ({ dataVersion: state.dataVersion + 1 })),
 }))
 
