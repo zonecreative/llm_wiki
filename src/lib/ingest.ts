@@ -40,8 +40,8 @@ import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
 import { heuristicClassify } from "@/lib/document-classifier"
-import { parseHeadingTree, countEncyclopediaEntries, classifyHeadings, computeEntrySlugs } from "@/lib/heading-parser"
-import type { IngestStrategy, ClassificationResult, HeadingNode } from "@/types/ingest"
+import { parseHeadingTree, countEncyclopediaEntries, classifyHeadings, computeEntrySlugs, computeEncyclopediaSlug } from "@/lib/heading-parser"
+import type { IngestStrategy, ClassificationResult, HeadingNode, SlugMode } from "@/types/ingest"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
@@ -581,10 +581,18 @@ async function autoIngestImpl(
   // If the user pre-set a strategy for this specific file (via the
   // batch ingest dialog), use it directly — skip the classifier
   // and the confirmation dialog entirely.
-  const fileOverride = ingestStrategyConfig.fileOverrides?.[fileName]
+  const rawOverride = ingestStrategyConfig.fileOverrides?.[fileName]
+  // Backward compat: old overrides were plain strings (just the strategy).
+  // New overrides are objects with strategy + slugMode + slugNamespace.
+  const fileOverride = typeof rawOverride === "string"
+    ? { strategy: rawOverride as IngestStrategy }
+    : rawOverride
+  const fileSlugMode: SlugMode = fileOverride?.slugMode ?? "default"
+  const fileSlugNamespace = fileOverride?.slugNamespace
+
   if (fileOverride) {
-    ingestStrategy = fileOverride
-    console.log(`[ingest:strategy] using per-file override "${fileOverride}" for "${fileName}"`)
+    ingestStrategy = fileOverride.strategy
+    console.log(`[ingest:strategy] using per-file override "${fileOverride.strategy}" (slug: ${fileSlugMode}) for "${fileName}"`)
   } else if (ingestStrategyConfig.mode === "auto") {
     classification = heuristicClassify(sourceContent)
     if (classification.requiresUserConfirmation && interactive) {
@@ -924,51 +932,435 @@ async function autoIngestImpl(
   // LLM takes the analysis as context and produces wiki files + review items
   activity.updateItem(activityId, { detail: "Step 2/2: Generating wiki pages..." })
 
-  let generation = ""
+  // Accumulators for review items and aggregate repair across batches
+  let allReviewItems = ""
+  let allWrittenPaths: string[] = []
+  let allWriteWarnings: string[] = []
+  let allHardFailures: string[] = []
+  let generation = "" // used for non-batch mode and for review stage at the end
+  let batchCheckpointPath: string | undefined // cleared on successful completion
 
-  await streamChat(
-    llmConfig,
-    [
-      { role: "system", content: buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, sourceContext, sourceSummaryPath, ingestStrategy, headingTree) },
-      {
-        role: "user",
-        content: [
-          `Source document to process: **${sourceIdentity}**`,
+  // ── Encyclopedia batch generation ──
+  // When encyclopedia mode has many entries (> MAX_BATCH_ENTRIES), a
+  // single LLM call can't generate hundreds of FILE blocks. Instead:
+  //   1. Split entries into batches of ~MAX_BATCH_ENTRIES
+  //   2. For each batch: generate FILE blocks → WRITE immediately → free memory
+  //   3. Each batch's prompt includes the ACTUAL CONTENT of each entry's
+  //      heading (from HeadingNode.content), so the LLM has real text
+  //      to work with — not just titles.
+  //   4. After each batch, save a checkpoint so if the process crashes
+  //      or is cancelled, the next run resumes from where it left off.
+  const MAX_BATCH_ENTRIES = 20
+  let encyclopediaBatches: HeadingNode[][] = []
+  if (ingestStrategy === "encyclopedia" && headingTree.length > 0) {
+    const classification = classifyHeadings(headingTree, 1)
+    if (classification.entries.length > MAX_BATCH_ENTRIES) {
+      encyclopediaBatches = chunkArray(classification.entries, MAX_BATCH_ENTRIES)
+      console.log(
+        `[ingest:strategy] encyclopedia batch generation: ${classification.entries.length} entries → ${encyclopediaBatches.length} batches of ~${MAX_BATCH_ENTRIES}`,
+      )
+    }
+  }
+
+  if (encyclopediaBatches.length > 0) {
+    // ── Batch mode: generate + write each batch independently ──
+    await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
+
+    // ── Checkpoint: try to resume from a previous interrupted run ──
+    const sourceHash = hashTextHex(sourceContent)
+    batchCheckpointPath = `${pp}/.llm-wiki/ingest-progress/enc-batch-${sourceSummarySlug}-${sourceHash}.json`
+    let completedBatches = 0
+
+    try {
+      const raw = await readFile(batchCheckpointPath)
+      const cp = JSON.parse(raw) as {
+        sourceIdentity: string
+        totalBatches: number
+        completedThrough: number
+        writtenPaths: string[]
+      }
+      if (
+        cp.sourceIdentity === sourceIdentity &&
+        cp.totalBatches === encyclopediaBatches.length &&
+        cp.completedThrough >= 0 &&
+        cp.completedThrough <= encyclopediaBatches.length
+      ) {
+        completedBatches = cp.completedThrough
+        allWrittenPaths = [...cp.writtenPaths]
+        console.log(
+          `[ingest:strategy] resuming encyclopedia batch from ${completedBatches}/${encyclopediaBatches.length} (${allWrittenPaths.length} files already written)`,
+        )
+        activity.updateItem(activityId, {
+          detail: `Resuming from batch ${completedBatches + 1}/${encyclopediaBatches.length}...`,
+        })
+      }
+    } catch {
+      // No checkpoint — start from scratch
+    }
+
+    for (let i = completedBatches; i < encyclopediaBatches.length; i++) {
+      if (signal?.aborted) throw new Error("Ingest cancelled")
+      const batch = encyclopediaBatches[i]
+      activity.updateItem(activityId, {
+        detail: `Generating wiki pages... batch ${i + 1}/${encyclopediaBatches.length} (${batch.length} entries)`,
+      })
+
+      // Build the user message with ACTUAL CONTENT of each entry.
+      // This is the key difference from the old approach: instead of
+      // passing the full sourceContext (a digest for long docs), we
+      // pass the real heading content for each entry in this batch.
+      const entryContents = batch.map((entry) => {
+        const slug = computeEncyclopediaSlug(entry, fileSlugMode, fileName.replace(/\.[^.]+$/, ""), fileSlugNamespace)
+        return [
+          `### Entry: ${entry.title}`,
+          `Slug: ${slug}`,
+          `Heading path: ${entry.headingPath.join(" > ")}`,
+          `Level: ${entry.level}`,
+          entry.parent ? `Parent: ${entry.parent}` : "Parent: (top-level)",
           "",
-          "The Stage 1 analysis below is CONTEXT to inform your output. Do NOT echo",
-          "its tables, bullet points, or prose. Your output must be FILE/REVIEW",
-          "blocks as specified in the system prompt — nothing else.",
-          "",
-          "## Stage 1 Analysis (context only — do not repeat)",
-          "",
-          analysis,
-          "",
-          "## Source Context",
-          "",
-          sourceContext,
+          "Content:",
+          entry.content,
           "",
           "---",
-          "",
-          `Now emit the FILE blocks for the wiki files derived from **${sourceIdentity}**.`,
-          "Your response MUST begin with `---FILE:` as the very first characters.",
-          "No preamble. No analysis prose. Start immediately.",
-        ].join("\n"),
+        ].join("\n")
+      }).join("\n\n")
+
+      let batchGeneration = ""
+      await streamChat(
+        llmConfig,
+        [
+          {
+            role: "system",
+            content: [
+              "You are a wiki page generator. For each entry below, create a wiki page FILE block.",
+              "Do not output chain-of-thought, hidden reasoning, or explanatory preamble.",
+              "",
+              languageRule(sourceContext),
+              "",
+              `## IMPORTANT: Source File`,
+              `The original source file is: **${sourceIdentity}**`,
+              `All wiki pages generated from this source MUST include this filename in their frontmatter \`sources\` field.`,
+              `Today's date is **${currentWikiDate()}**. Use this exact date for all new \`created\`, \`updated\` fields.`,
+              "",
+              "## Frontmatter Rules",
+              "1. The VERY FIRST line MUST be exactly `---` (three hyphens).",
+              "2. Each frontmatter line is a `key: value` pair on its own line.",
+              "3. The frontmatter ends with another `---` line on its own.",
+              "4. Required fields: type, title, created, updated, tags, related, sources",
+              `5. type — one of: ${GENERATION_WIKI_TYPES.join(" | ")}`,
+              "6. tags — array: `tags: [tag1, tag2]`",
+              "7. related — array of bare slugs: `related: [foo, bar]`",
+              `8. sources — array; MUST include "${sourceIdentity}"`,
+              "9. Use [[wikilink]] syntax in BODY for cross-references.",
+              "10. Use kebab-case filenames.",
+              "",
+              "## Encyclopedia-specific frontmatter",
+              "Each page MUST also include:",
+              "  - `parent`: slug of parent entry (or null)",
+              "  - `ancestor`: slug of nearest H1 entry (or null)",
+              "  - `heading_level`: heading level (1, 2, ...)",
+              "  - `heading_path`: array of heading titles from root to this entry",
+              "  - `ingest_strategy: encyclopedia`",
+              "",
+              "## Output Format",
+              "FILE block template:",
+              "```",
+              "---FILE: wiki/concepts/<slug>.md---",
+              "(complete file content with YAML frontmatter)",
+              "---END FILE---",
+              "```",
+              "",
+              "Your response MUST begin with `---FILE:`. No preamble.",
+              `Generate FILE blocks for these ${batch.length} entries (batch ${i + 1} of ${encyclopediaBatches.length}):`,
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: entryContents,
+          },
+        ],
+        {
+          onToken: (token) => { batchGeneration += token },
+          onDone: () => {},
+          onError: (err) => {
+            activity.updateItem(activityId, { status: "error", detail: `Generation batch ${i + 1} failed: ${err.message}` })
+          },
+        },
+        signal,
+        {
+          temperature: 0.1,
+          reasoning: { mode: "off" },
+          max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
+        },
+      )
+
+      const batchActivity = useActivityStore.getState().items.find((item) => item.id === activityId)
+      if (batchActivity?.status === "error") {
+        // Save checkpoint before throwing so we can resume
+        await saveEncyclopediaBatchCheckpoint(batchCheckpointPath, {
+          sourceIdentity,
+          totalBatches: encyclopediaBatches.length,
+          completedThrough: i,
+          writtenPaths: allWrittenPaths,
+        })
+        throw new Error(batchActivity.detail || `Generation batch ${i + 1} failed`)
+      }
+
+      // ── Write this batch immediately ──
+      activity.updateItem(activityId, {
+        detail: `Writing batch ${i + 1}/${encyclopediaBatches.length}...`,
+      })
+
+      const batchWriteResult = await writeFileBlocks(
+        pp,
+        batchGeneration,
+        llmConfig,
+        sourceIdentity,
+        sourceSummaryPath,
+        signal,
+      )
+      allWrittenPaths.push(...batchWriteResult.writtenPaths)
+      allWriteWarnings.push(...batchWriteResult.warnings)
+      allHardFailures.push(...batchWriteResult.hardFailures)
+
+      // Collect REVIEW blocks from this batch
+      allReviewItems += batchGeneration + "\n\n"
+
+      // Free memory — the batch content is no longer needed
+      batchGeneration = ""
+
+      // ── Save checkpoint after each batch ──
+      await saveEncyclopediaBatchCheckpoint(batchCheckpointPath, {
+        sourceIdentity,
+        totalBatches: encyclopediaBatches.length,
+        completedThrough: i + 1,
+        writtenPaths: allWrittenPaths,
+      })
+
+      console.log(
+        `[ingest:strategy] batch ${i + 1}/${encyclopediaBatches.length} done: ${batchWriteResult.writtenPaths.length} files written (total: ${allWrittenPaths.length})`,
+      )
+    }
+
+    // ── All batches done — clear the checkpoint ──
+    await clearEncyclopediaBatchCheckpoint(batchCheckpointPath)
+
+    // ── Gap fill: generate missing parent/ancestor pages ──
+    // After all batches, some parent slugs referenced in children's
+    // frontmatter may not exist as files — either because the parent
+    // was a context heading that got promoted to entry but the LLM
+    // didn't generate it, or because the batch containing the parent
+    // was interrupted. This pass finds those missing parents and
+    // generates them in a single LLM call.
+    if (allWrittenPaths.length > 0) {
+      const writtenSlugs = new Set(
+        allWrittenPaths.map((p) => p.replace(/^wiki\/(concepts|entities)\//, "").replace(/\.md$/, "")),
+      )
+
+      // Collect all parent/ancestor slugs from written files
+      const missingSlugs = new Set<string>()
+      for (const path of allWrittenPaths) {
+        if (!path.endsWith(".md")) continue
+        try {
+          const content = await readFile(`${pp}/${path}`)
+          const fm = parseFrontmatter(content)
+          if (!fm.frontmatter) continue
+          const parent = fm.frontmatter.parent
+          const ancestor = fm.frontmatter.ancestor
+          if (typeof parent === "string" && parent !== "null" && parent !== "None") {
+            if (!writtenSlugs.has(parent)) missingSlugs.add(parent)
+          }
+          if (typeof ancestor === "string" && ancestor !== "null" && ancestor !== "None") {
+            if (!writtenSlugs.has(ancestor)) missingSlugs.add(ancestor)
+          }
+        } catch {
+          // Can't read — skip
+        }
+      }
+
+      if (missingSlugs.size > 0) {
+        console.log(
+          `[ingest:strategy] gap fill: ${missingSlugs.size} missing parent/ancestor slug(s) detected`,
+        )
+
+        // Find the corresponding HeadingNode for each missing slug
+        // by searching the original heading tree + classification
+        const classification = classifyHeadings(headingTree, 1)
+        const allNodes = [...classification.entries, ...classification.structural, ...classification.context]
+        const documentName = fileName.replace(/\.[^.]+$/, "")
+
+        const missingEntries: { slug: string; node: HeadingNode }[] = []
+        for (const slug of missingSlugs) {
+          // Find a node whose computed slug matches
+          const node = allNodes.find(
+            (n) => computeEncyclopediaSlug(n, fileSlugMode, documentName, fileSlugNamespace) === slug,
+          )
+          if (node) {
+            missingEntries.push({ slug, node })
+          } else {
+            console.warn(`[ingest:strategy] gap fill: could not find heading node for slug "${slug}"`)
+          }
+        }
+
+        if (missingEntries.length > 0) {
+          activity.updateItem(activityId, {
+            detail: `Gap fill: generating ${missingEntries.length} missing parent page(s)...`,
+          })
+
+          const gapEntryContents = missingEntries.map(({ slug, node }) => {
+            return [
+              `### Entry: ${node.title}`,
+              `Slug: ${slug}`,
+              `Heading path: ${node.headingPath.join(" > ")}`,
+              `Level: ${node.level}`,
+              node.parent ? `Parent: ${node.parent}` : "Parent: (top-level)",
+              "",
+              "Content:",
+              node.content || "(This is a structural/organizational heading — create a brief overview page that links to its children.)",
+              "",
+              "---",
+            ].join("\n")
+          }).join("\n\n")
+
+          let gapGeneration = ""
+          await streamChat(
+            llmConfig,
+            [
+              {
+                role: "system",
+                content: [
+                  "You are a wiki page generator. For each entry below, create a wiki page FILE block.",
+                  "Do not output chain-of-thought, hidden reasoning, or explanatory preamble.",
+                  "",
+                  languageRule(sourceContext),
+                  "",
+                  `## IMPORTANT: Source File`,
+                  `The original source file is: **${sourceIdentity}**`,
+                  `All wiki pages generated from this source MUST include this filename in their frontmatter \`sources\` field.`,
+                  `Today's date is **${currentWikiDate()}**.`,
+                  "",
+                  "## Frontmatter Rules",
+                  "1. First line MUST be `---`.",
+                  "2. Required fields: type, title, created, updated, tags, related, sources",
+                  `3. type — one of: ${GENERATION_WIKI_TYPES.join(" | ")}`,
+                  "4. tags — array: `tags: [tag1]`",
+                  "5. related — array of bare slugs",
+                  `6. sources — array; MUST include "${sourceIdentity}"`,
+                  "7. Use [[wikilink]] in body.",
+                  "",
+                  "## Encyclopedia-specific frontmatter",
+                  "  - `parent`: slug of parent (or null)",
+                  "  - `ancestor`: slug of nearest H1 (or null)",
+                  "  - `heading_level`: heading level",
+                  "  - `heading_path`: array of titles",
+                  "  - `ingest_strategy: encyclopedia`",
+                  "",
+                  "## IMPORTANT: Include Sub-entries section",
+                  "Each page MUST include a `## Sub-entries` section listing all known children",
+                  "as `[[child-slug]]` wikilinks. If you don't know the children, list the",
+                  "entries from the heading_path that are deeper than this page.",
+                  "",
+                  "## Output Format",
+                  "```",
+                  "---FILE: wiki/concepts/<slug>.md---",
+                  "(content)",
+                  "---END FILE---",
+                  "```",
+                  "",
+                  "Your response MUST begin with `---FILE:`. No preamble.",
+                  `Generate FILE blocks for these ${missingEntries.length} missing parent entries:`,
+                ].join("\n"),
+              },
+              {
+                role: "user",
+                content: gapEntryContents,
+              },
+            ],
+            {
+              onToken: (token) => { gapGeneration += token },
+              onDone: () => {},
+              onError: (err) => {
+                console.warn(`[ingest:strategy] gap fill generation failed: ${err.message}`)
+              },
+            },
+            signal,
+            {
+              temperature: 0.1,
+              reasoning: { mode: "off" },
+              max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
+            },
+          )
+
+          // Write gap fill pages
+          if (gapGeneration.trim()) {
+            const gapWriteResult = await writeFileBlocks(
+              pp,
+              gapGeneration,
+              llmConfig,
+              sourceIdentity,
+              sourceSummaryPath,
+              signal,
+            )
+            allWrittenPaths.push(...gapWriteResult.writtenPaths)
+            allWriteWarnings.push(...gapWriteResult.warnings)
+            allHardFailures.push(...gapWriteResult.hardFailures)
+            generation += gapGeneration + "\n\n"
+            console.log(
+              `[ingest:strategy] gap fill done: ${gapWriteResult.writtenPaths.length} parent page(s) generated`,
+            )
+          }
+        }
+      }
+    }
+
+    // Use the accumulated review items for the review stage
+    generation = allReviewItems
+  } else {
+    // Standard mode: single LLM call
+    await streamChat(
+      llmConfig,
+      [
+        { role: "system", content: buildGenerationPrompt(schema, purpose, index, sourceIdentity, overview, sourceContext, sourceSummaryPath, ingestStrategy, headingTree, fileSlugMode, fileSlugNamespace) },
+        {
+          role: "user",
+          content: [
+            `Source document to process: **${sourceIdentity}**`,
+            "",
+            "The Stage 1 analysis below is CONTEXT to inform your output. Do NOT echo",
+            "its tables, bullet points, or prose. Your output must be FILE/REVIEW",
+            "blocks as specified in the system prompt — nothing else.",
+            "",
+            "## Stage 1 Analysis (context only — do not repeat)",
+            "",
+            analysis,
+            "",
+            "## Source Context",
+            "",
+            sourceContext,
+            "",
+            "---",
+            "",
+            `Now emit the FILE blocks for the wiki files derived from **${sourceIdentity}**.`,
+            "Your response MUST begin with `---FILE:` as the very first characters.",
+            "No preamble. No analysis prose. Start immediately.",
+          ].join("\n"),
+        },
+      ],
+      {
+        onToken: (token) => { generation += token },
+        onDone: () => {},
+        onError: (err) => {
+          activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
+        },
       },
-    ],
-    {
-      onToken: (token) => { generation += token },
-      onDone: () => {},
-      onError: (err) => {
-        activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
+      signal,
+      {
+        temperature: 0.1,
+        reasoning: { mode: "off" },
+        max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
       },
-    },
-    signal,
-    {
-      temperature: 0.1,
-      reasoning: { mode: "off" },
-      max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
-    },
-  )
+    )
+  }
 
   const generationActivity = useActivityStore.getState().items.find((i) => i.id === activityId)
   if (generationActivity?.status === "error") {
@@ -1023,19 +1415,33 @@ async function autoIngestImpl(
   }
 
   // ── Step 3: Write files ───────────────────────────────────────
-  activity.updateItem(activityId, { detail: "Writing files..." })
-  await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
-  const writeResult = await writeFileBlocks(
-    pp,
-    generation,
-    llmConfig,
-    sourceIdentity,
-    sourceSummaryPath,
-    signal,
-  )
-  const writtenPaths = writeResult.writtenPaths
-  const writeWarnings = writeResult.warnings
-  const hardFailures = writeResult.hardFailures
+  // In batch mode, files were already written per-batch above.
+  // In standard mode, write all at once.
+  let writtenPaths: string[]
+  let writeWarnings: string[]
+  let hardFailures: string[]
+
+  if (encyclopediaBatches.length > 0) {
+    // Batch mode: files already written, just use accumulated results
+    writtenPaths = allWrittenPaths
+    writeWarnings = allWriteWarnings
+    hardFailures = allHardFailures
+  } else {
+    // Standard mode: write all generation output at once
+    activity.updateItem(activityId, { detail: "Writing files..." })
+    await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
+    const writeResult = await writeFileBlocks(
+      pp,
+      generation,
+      llmConfig,
+      sourceIdentity,
+      sourceSummaryPath,
+      signal,
+    )
+    writtenPaths = writeResult.writtenPaths
+    writeWarnings = writeResult.warnings
+    hardFailures = writeResult.hardFailures
+  }
 
   // ── Post-generation drift check (encyclopedia mode) ────────────
   // Compares the number of concept/entity pages generated against the
@@ -1230,6 +1636,9 @@ async function autoIngestImpl(
     await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, ingestStrategy)
     if (longSourceCheckpointPath) {
       await clearLongSourceCheckpoint(longSourceCheckpointPath)
+    }
+    if (batchCheckpointPath) {
+      await clearEncyclopediaBatchCheckpoint(batchCheckpointPath)
     }
   } else if (hardFailures.length > 0) {
     console.warn(
@@ -1898,6 +2307,9 @@ function buildAnalysisStrategyHint(strategy: IngestStrategy): string {
 function buildGenerationStrategySection(
   strategy?: IngestStrategy,
   headingTree?: HeadingNode[],
+  slugMode: SlugMode = "default",
+  documentName?: string,
+  customNamespace?: string,
 ): string {
   if (!strategy || strategy === "fixed") return ""
 
@@ -1909,7 +2321,7 @@ function buildGenerationStrategySection(
     // gets a deterministic slug: {H1-slug}-{leaf-slug}. This prevents
     // cross-document collisions (different H1 → different prefix) and
     // keeps slugs short (only 2 segments, not the full hierarchy).
-    const entrySlugs = computeEntrySlugs(classification.entries)
+    const entrySlugs = computeEntrySlugs(classification.entries, slugMode, documentName, customNamespace)
 
     // Build parent → children map for the linking instructions.
     // An entry's children are other entries whose headingPath extends
@@ -2111,11 +2523,14 @@ export function buildGenerationPrompt(
   sourceSummaryPath?: string,
   ingestStrategy?: IngestStrategy,
   headingTree?: HeadingNode[],
+  slugMode: SlugMode = "default",
+  customNamespace?: string,
 ): string {
   // Use original filename (without extension) as the source summary page name
   const sourceBaseName = sourceFileName.replace(/\.[^.]+$/, "")
   const summaryPath = sourceSummaryPath ?? `wiki/sources/${sourceBaseName}.md`
   const today = currentWikiDate()
+  const documentName = sourceBaseName
 
   return [
     "You are a wiki maintainer. Based on the analysis provided, generate wiki files.",
@@ -2201,7 +2616,7 @@ export function buildGenerationPrompt(
     "- Follow the analysis recommendations on what to emphasize",
     "- If the analysis found connections to existing pages, add cross-references",
     "",
-    buildGenerationStrategySection(ingestStrategy, headingTree),
+    buildGenerationStrategySection(ingestStrategy, headingTree, slugMode, documentName, customNamespace),
     "",
     "## Review block types",
     "",
@@ -2412,6 +2827,20 @@ async function tryReadSourceTextFile(path: string): Promise<string> {
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
+}
+
+/**
+ * Split an array into chunks of `size` elements each. Used by the
+ * encyclopedia batch generation to divide hundreds of heading entries
+ * into manageable LLM calls.
+ */
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  if (size <= 0) return [arr]
+  const chunks: T[][] = []
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size))
+  }
+  return chunks
 }
 
 export function computeIngestSourceBudget(
@@ -2653,6 +3082,40 @@ async function clearLongSourceCheckpoint(checkpointPath: string): Promise<void> 
   } catch {
     // Best-effort cleanup. A stale checkpoint is ignored if source
     // hash / chunk shape no longer matches.
+  }
+}
+
+// ── Encyclopedia batch checkpoint ──────────────────────────────
+
+interface EncyclopediaBatchCheckpoint {
+  sourceIdentity: string
+  totalBatches: number
+  completedThrough: number
+  writtenPaths: string[]
+  updatedAt: number
+}
+
+async function saveEncyclopediaBatchCheckpoint(
+  checkpointPath: string,
+  data: Omit<EncyclopediaBatchCheckpoint, "updatedAt">,
+): Promise<void> {
+  try {
+    const dir = checkpointPath.split("/").slice(0, -1).join("/")
+    await createDirectory(dir)
+    const cp: EncyclopediaBatchCheckpoint = { ...data, updatedAt: Date.now() }
+    await writeFile(checkpointPath, JSON.stringify(cp, null, 2))
+  } catch (err) {
+    console.warn(`[ingest:batch-checkpoint] failed to save:`, err)
+  }
+}
+
+async function clearEncyclopediaBatchCheckpoint(checkpointPath: string): Promise<void> {
+  try {
+    if (await fileExists(checkpointPath)) {
+      await deleteFile(checkpointPath)
+    }
+  } catch {
+    // Best-effort
   }
 }
 

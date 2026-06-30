@@ -21,7 +21,7 @@ import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
  *   - The slug computation rule changes
  *   - The parent-child linking logic changes
  */
-export const INGEST_PIPELINE_VERSION = "2"
+export const INGEST_PIPELINE_VERSION = "7"
 
 interface CacheEntry {
   hash: string

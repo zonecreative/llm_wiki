@@ -543,7 +543,7 @@ describe("classifyHeadings — backward compatibility", () => {
 // ── Encyclopedia slug computation ────────────────────────────────
 
 describe("computeEncyclopediaSlug", () => {
-  it("combines H1 ancestor + leaf heading", () => {
+  it("combines H1 ancestor + leaf heading (title-concept mode)", () => {
     const content = [
       "# Nani delle Montagne",
       "I Nani delle Montagne sono un popolo antico e fiero, abitante di Kélamnkor.",
@@ -554,10 +554,10 @@ describe("computeEncyclopediaSlug", () => {
     ].join("\n")
     const nodes = parseHeadingTree(content)
     const rituali = nodes.find((n) => n.title === "Rituali")!
-    expect(computeEncyclopediaSlug(rituali)).toBe("nani-delle-montagne-rituali")
+    expect(computeEncyclopediaSlug(rituali, "title-concept", "Nani delle Montagne")).toBe("nani-delle-montagne-rituali")
   })
 
-  it("disambiguates same leaf under different H1", () => {
+  it("disambiguates same leaf under different H1 (title-concept mode)", () => {
     const naniContent = [
       "# Nani delle Montagne",
       "I Nani delle Montagne sono un popolo antico e fiero di Kélamnkor.",
@@ -572,21 +572,18 @@ describe("computeEncyclopediaSlug", () => {
     ].join("\n")
     const naniNode = parseHeadingTree(naniContent).find((n) => n.title === "Apparato Uditivo")!
     const elfiNode = parseHeadingTree(elfiContent).find((n) => n.title === "Apparato Uditivo")!
-    expect(computeEncyclopediaSlug(naniNode)).toBe("nani-delle-montagne-apparato-uditivo")
-    expect(computeEncyclopediaSlug(elfiNode)).toBe("elfi-della-foresta-apparato-uditivo")
-    expect(computeEncyclopediaSlug(naniNode)).not.toBe(computeEncyclopediaSlug(elfiNode))
+    expect(computeEncyclopediaSlug(naniNode, "title-concept", "Nani delle Montagne")).toBe("nani-delle-montagne-apparato-uditivo")
+    expect(computeEncyclopediaSlug(elfiNode, "title-concept", "Elfi della Foresta")).toBe("elfi-della-foresta-apparato-uditivo")
   })
 
-  it("works for H1 entries (ancestor = self)", () => {
+  it("default mode returns leaf only", () => {
     const content = [
       "# Storia del Mondo",
       "La storia del mondo conosciuto abbraccia millenni di eventi e civiltà.",
     ].join("\n")
     const nodes = parseHeadingTree(content)
     const h1 = nodes[0]
-    // H1 + self = doubled slug. This is acceptable — H1 entries are rare
-    // and the doubled slug is still unique and readable.
-    expect(computeEncyclopediaSlug(h1)).toBe("storia-del-mondo-storia-del-mondo")
+    expect(computeEncyclopediaSlug(h1, "default")).toBe("storia-del-mondo")
   })
 
   it("handles Italian special characters", () => {
@@ -598,8 +595,7 @@ describe("computeEncyclopediaSlug", () => {
     ].join("\n")
     const nodes = parseHeadingTree(content)
     const k = nodes.find((n) => n.title === "Kélamnkor")!
-    const slug = computeEncyclopediaSlug(k)
-    // makeQuerySlug keeps Unicode letters (including é) for CJK support
+    const slug = computeEncyclopediaSlug(k, "title-concept", "Compendio dei Nani")
     expect(slug).toBe("compendio-dei-nani-kélamnkor")
   })
 })
@@ -618,10 +614,212 @@ describe("computeEntrySlugs", () => {
     ].join("\n")
     const nodes = parseHeadingTree(content)
     const { entries } = classifyHeadings(nodes, 1)
-    const slugs = computeEntrySlugs(entries)
+    const slugs = computeEntrySlugs(entries, "title-concept", "Manuale GDR")
     expect(slugs.size).toBe(entries.length)
     expect(slugs.get(entries.find((e) => e.title === "Palla di Fuoco")!.pathKey)).toBe("manuale-gdr-palla-di-fuoco")
     expect(slugs.get(entries.find((e) => e.title === "Fulmine")!.pathKey)).toBe("manuale-gdr-fulmine")
     expect(slugs.get(entries.find((e) => e.title === "Magie")!.pathKey)).toBe("manuale-gdr-magie")
+  })
+})
+
+// ── Slug mode tests ──────────────────────────────────────────────
+
+describe("computeEncyclopediaSlug — slug modes", () => {
+  const content = [
+    "# Nani delle Montagne",
+    "I Nani delle Montagne sono un popolo antico e fiero di Kélamnkor.",
+    "## Cultura",
+    "La cultura dei Nani delle Montagne è ricca e antica.",
+    "### Rituali",
+    "I rituali dei Nani sono cerimonie sacre che segnano i momenti importanti.",
+  ].join("\n")
+  const nodes = parseHeadingTree(content)
+  const rituali = nodes.find((n) => n.title === "Rituali")!
+
+  it("default mode: leaf only", () => {
+    expect(computeEncyclopediaSlug(rituali, "default")).toBe("rituali")
+  })
+
+  it("title-concept mode: document name + leaf", () => {
+    expect(computeEncyclopediaSlug(rituali, "title-concept", "Compendio dei Nani")).toBe("compendio-dei-nani-rituali")
+  })
+
+  it("full-hierarchy mode: entire heading path", () => {
+    expect(computeEncyclopediaSlug(rituali, "full-hierarchy")).toBe("nani-delle-montagne-cultura-rituali")
+  })
+
+  it("manual mode: custom namespace + leaf", () => {
+    expect(computeEncyclopediaSlug(rituali, "manual", undefined, "nani-delle-montagne")).toBe("nani-delle-montagne-rituali")
+  })
+
+  it("manual mode with empty namespace falls back to leaf", () => {
+    expect(computeEncyclopediaSlug(rituali, "manual", undefined, "")).toBe("rituali")
+  })
+})
+
+describe("computeEncyclopediaSlug — duplicate prevention", () => {
+  it("collapses duplicate when ancestor equals leaf (title-concept)", () => {
+    const content = [
+      "# Fondamenti Cosmologici",
+      "I fondamenti cosmologici dell'universo duale di Soeliok sono complessi.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const h1 = nodes[0]
+    // documentName = "Fondamenti Cosmologici", leaf = "Fondamenti Cosmologici"
+    // → should NOT produce "fondamenti-cosmologici-fondamenti-cosmologici"
+    const slug = computeEncyclopediaSlug(h1, "title-concept", "Fondamenti Cosmologici")
+    expect(slug).toBe("fondamenti-cosmologici")
+    expect(slug).not.toBe("fondamenti-cosmologici-fondamenti-cosmologici")
+  })
+
+  it("collapses duplicate in full-hierarchy when consecutive parts match", () => {
+    const content = [
+      "# Storia",
+      "La storia dei nani è millenaria e ricca di eventi importanti.",
+      "## Storia",
+      "Questa sezione approfondisce la storia dei nani delle montagne.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const h2 = nodes.find((n) => n.level === 2)!
+    // headingPath: ["Storia", "Storia"] → should NOT produce "storia-storia"
+    const slug = computeEncyclopediaSlug(h2, "full-hierarchy")
+    expect(slug).toBe("storia")
+  })
+
+  it("collapses duplicate when namespace ends with leaf (manual mode)", () => {
+    const content = [
+      "# Cultura",
+      "La cultura dei nani è ricca e antica, basata su tradizioni millenarie.",
+      "### Rituali",
+      "I rituali dei nani sono cerimonie sacre molto importanti per il popolo.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const rituali = nodes.find((n) => n.title === "Rituali")!
+    // namespace = "nani-rituali", leaf = "rituali" → should NOT produce "nani-rituali-rituali"
+    const slug = computeEncyclopediaSlug(rituali, "manual", undefined, "nani-rituali")
+    expect(slug).toBe("nani-rituali")
+  })
+})
+
+describe("computeEntrySlugs — with slug mode", () => {
+  it("computes slugs with title-concept mode", () => {
+    const content = [
+      "# Manuale GDR",
+      "Il manuale del gioco di ruolo con tutte le magie e armi del mondo.",
+      "## Magie",
+      "Le magie sono potenti incantesimi che possono essere lanciati.",
+      "### Palla di Fuoco",
+      "Una sfera di fuoco che esplode causando danni ad area estesa.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const { entries } = classifyHeadings(nodes, 1)
+    const slugs = computeEntrySlugs(entries, "title-concept", "Manuale GDR")
+    const palla = entries.find((e) => e.title === "Palla di Fuoco")!
+    expect(slugs.get(palla.pathKey)).toBe("manuale-gdr-palla-di-fuoco")
+  })
+
+  it("computes slugs with full-hierarchy mode", () => {
+    const content = [
+      "# Manuale GDR",
+      "Il manuale del gioco di ruolo con tutte le magie e armi del mondo.",
+      "## Magie",
+      "Le magie sono potenti incantesimi che possono essere lanciati.",
+      "### Palla di Fuoco",
+      "Una sfera di fuoco che esplode causando danni ad area estesa.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const { entries } = classifyHeadings(nodes, 1)
+    const slugs = computeEntrySlugs(entries, "full-hierarchy")
+    const palla = entries.find((e) => e.title === "Palla di Fuoco")!
+    expect(slugs.get(palla.pathKey)).toBe("manuale-gdr-magie-palla-di-fuoco")
+  })
+})
+
+// ── doc+h1+leaf and doc+h1+h2+leaf slug modes ───────────────────
+
+describe("computeEncyclopediaSlug — doc+h1+leaf mode", () => {
+  it("combines document name + H1 + leaf", () => {
+    const content = [
+      "# Storia",
+      "La storia dei nani è millenaria e ricca di eventi importanti.",
+      "## Era Antica",
+      "L'era antica segna le origini del popolo dei nani delle montagne.",
+      "### Origini",
+      "Le origini dei nani si collocano nella catena montuosa di Norkiak.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const origins = nodes.find((n) => n.title === "Origini")!
+    expect(computeEncyclopediaSlug(origins, "doc-h1-leaf", "Compendio dei Nani")).toBe("compendio-dei-nani-storia-origini")
+  })
+
+  it("collapses duplicates when H1 equals leaf", () => {
+    const content = [
+      "# Storia",
+      "La storia dei nani è millenaria e ricca di eventi molto importanti.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const h1 = nodes[0]
+    // doc="Compendio", h1="Storia", leaf="Storia" → no "storia-storia"
+    expect(computeEncyclopediaSlug(h1, "doc-h1-leaf", "Compendio")).toBe("compendio-storia")
+  })
+
+  it("collapses duplicates when doc equals H1", () => {
+    const content = [
+      "# Storia",
+      "La storia dei nani è millenaria e ricca di eventi molto importanti.",
+      "## Origini",
+      "Le origini dei nani si collocano nella catena montuosa di Norkiak.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const origins = nodes.find((n) => n.title === "Origini")!
+    // doc="Storia", h1="Storia", leaf="Origini" → no "storia-storia-origini"
+    expect(computeEncyclopediaSlug(origins, "doc-h1-leaf", "Storia")).toBe("storia-origini")
+  })
+})
+
+describe("computeEncyclopediaSlug — doc+h1+h2+leaf mode", () => {
+  it("combines document name + H1 + H2 + leaf", () => {
+    const content = [
+      "# Storia",
+      "La storia dei nani è millenaria e ricca di eventi importanti.",
+      "## Era Antica",
+      "L'era antica segna le origini del popolo dei nani delle montagne.",
+      "### Origini",
+      "Le origini dei nani si collocano nella catena montuosa di Norkiak.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const origins = nodes.find((n) => n.title === "Origini")!
+    expect(computeEncyclopediaSlug(origins, "doc-h1-h2-leaf", "Compendio dei Nani")).toBe("compendio-dei-nani-storia-era-antica-origini")
+  })
+
+  it("skips H2 when not present (falls back to doc+h1+leaf)", () => {
+    const content = [
+      "# Storia",
+      "La storia dei nani è millenaria e ricca di eventi molto importanti.",
+      "## Origini",
+      "Le origini dei nani si collocano nella catena montuosa di Norkiak.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const origins = nodes.find((n) => n.title === "Origini")!
+    // headingPath: ["Storia", "Origini"] — no H2, so it's doc+h1+leaf
+    expect(computeEncyclopediaSlug(origins, "doc-h1-h2-leaf", "Compendio")).toBe("compendio-storia-origini")
+  })
+
+  it("collapses consecutive duplicates", () => {
+    const content = [
+      "# Storia",
+      "La storia dei nani è millenaria e ricca di eventi molto importanti.",
+      "## Storia Antica",
+      "La storia antica segna le origini del popolo dei nani montanari.",
+      "### Le Origini",
+      "Le origini dei nani si collocano nella catena montuosa di Norkiak.",
+    ].join("\n")
+    const nodes = parseHeadingTree(content)
+    const origins = nodes.find((n) => n.title === "Le Origini")!
+    // doc="Storia", h1="Storia", h2="Storia Antica" → consecutive "storia" collapses
+    const slug = computeEncyclopediaSlug(origins, "doc-h1-h2-leaf", "Storia")
+    // "storia" (doc) and "storia" (h1) are consecutive duplicates → collapsed to one
+    // Result should be "storia-storia-antica-le-origini" (one "storia", then "storia-antica")
+    expect(slug).toBe("storia-storia-antica-le-origini")
   })
 })

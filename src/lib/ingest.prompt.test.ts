@@ -253,8 +253,8 @@ describe("buildGenerationPrompt — encyclopedia mode", () => {
     // Heading titles from the tree should appear in the prompt
     expect(prompt).toContain("Cultura")
     expect(prompt).toContain("Rituali")
-    // Pre-computed slugs should appear
-    expect(prompt).toContain("nani-delle-montagne-rituali")
+    // Pre-computed slugs should appear (default mode = leaf only)
+    expect(prompt).toContain("rituali")
   })
 
   it("omits encyclopedia section when headingTree is empty", () => {

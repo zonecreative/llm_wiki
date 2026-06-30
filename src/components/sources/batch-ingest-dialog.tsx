@@ -22,7 +22,8 @@ import { normalizePath } from "@/lib/path-utils"
 import { forceReingestSource } from "@/lib/source-lifecycle"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
 import { heuristicClassify } from "@/lib/document-classifier"
-import type { IngestStrategy } from "@/types/ingest"
+import type { IngestStrategy, SlugMode } from "@/types/ingest"
+import type { FileIngestOverride } from "@/types/ingest"
 import { collectAllFilesIncludingDot } from "@/lib/sources-tree-delete"
 import type { FileNode } from "@/types/wiki"
 
@@ -30,6 +31,8 @@ interface BatchFileEntry {
   path: string
   name: string
   strategy: IngestStrategy | "auto"
+  slugMode: SlugMode
+  slugNamespace: string
   suggested?: IngestStrategy
   confidence?: number
 }
@@ -103,9 +106,15 @@ export function BatchIngestDialog({ open, onClose }: Props) {
       for (const file of allFiles) {
         const fileName = file.name
         const existingOverride = ingestStrategyConfig.fileOverrides?.[fileName]
+        // Backward compat: old overrides were strings
+        const existingOverrideObj = typeof existingOverride === "string"
+          ? { strategy: existingOverride as IngestStrategy }
+          : existingOverride
 
         // Default: use existing override if present, else "auto"
-        let strategy: IngestStrategy | "auto" = existingOverride ?? "auto"
+        let strategy: IngestStrategy | "auto" = existingOverrideObj?.strategy ?? "auto"
+        let slugMode: SlugMode = existingOverrideObj?.slugMode ?? "default"
+        let slugNamespace: string = existingOverrideObj?.slugNamespace ?? ""
         let suggested: IngestStrategy | undefined
         let confidence: number | undefined
 
@@ -122,7 +131,7 @@ export function BatchIngestDialog({ open, onClose }: Props) {
           }
         }
 
-        entries.push({ path: file.path, name: fileName, strategy, suggested, confidence })
+        entries.push({ path: file.path, name: fileName, strategy, slugMode, slugNamespace, suggested, confidence })
       }
 
       setFiles(entries)
@@ -144,9 +153,28 @@ export function BatchIngestDialog({ open, onClose }: Props) {
     )
   }
 
+  // Update slug mode for a single file
+  const updateSlugMode = (fileName: string, slugMode: SlugMode) => {
+    setFiles((prev) =>
+      prev.map((f) => (f.name === fileName ? { ...f, slugMode } : f)),
+    )
+  }
+
+  // Update custom namespace for a single file
+  const updateSlugNamespace = (fileName: string, slugNamespace: string) => {
+    setFiles((prev) =>
+      prev.map((f) => (f.name === fileName ? { ...f, slugNamespace } : f)),
+    )
+  }
+
   // Bulk-apply a strategy to all files
   const applyToAll = (strategy: IngestStrategy | "auto") => {
     setFiles((prev) => prev.map((f) => ({ ...f, strategy })))
+  }
+
+  // Bulk-apply slug mode to all files
+  const applySlugModeToAll = (slugMode: SlugMode) => {
+    setFiles((prev) => prev.map((f) => ({ ...f, slugMode })))
   }
 
   // Accept all suggestions
@@ -164,10 +192,14 @@ export function BatchIngestDialog({ open, onClose }: Props) {
     if (!project || !hasUsableLlm(llmConfig)) return
 
     // Save per-file overrides to the store
-    const overrides: Record<string, IngestStrategy> = {}
+    const overrides: Record<string, FileIngestOverride> = {}
     for (const f of files) {
       if (f.strategy !== "auto") {
-        overrides[f.name] = f.strategy
+        overrides[f.name] = {
+          strategy: f.strategy,
+          slugMode: f.slugMode,
+          slugNamespace: f.slugMode === "manual" ? f.slugNamespace : undefined,
+        }
       }
     }
 
@@ -276,6 +308,17 @@ export function BatchIngestDialog({ open, onClose }: Props) {
           <div><strong>Fixed:</strong> saggi, articoli, paper, blog — il LLM decide liberamente cosa estrarre</div>
         </div>
 
+        {/* Slug mode bulk actions */}
+        <div className="flex flex-wrap items-center gap-2 border-b px-5 py-2 text-xs">
+          <span className="text-muted-foreground">Slug mode (encyclopedia only):</span>
+          <button className="rounded border px-2 py-0.5 hover:bg-accent" title="Just the heading title" onClick={() => applySlugModeToAll("default")}>Leaf only</button>
+          <button className="rounded border px-2 py-0.5 hover:bg-accent" title="Document name + leaf — best for compendiums where H1 is a section" onClick={() => applySlugModeToAll("title-concept")}>Doc+leaf</button>
+          <button className="rounded border px-2 py-0.5 hover:bg-accent" title="Document name + H1 + leaf — best for compendiums where H1 is a meaningful section" onClick={() => applySlugModeToAll("doc-h1-leaf")}>Doc+h1+leaf</button>
+          <button className="rounded border px-2 py-0.5 hover:bg-accent" title="Document name + H1 + H2 + leaf — for deeply structured compendiums" onClick={() => applySlugModeToAll("doc-h1-h2-leaf")}>Doc+h1+h2+leaf</button>
+          <button className="rounded border px-2 py-0.5 hover:bg-accent" title="Full heading path — best for nested game manuals" onClick={() => applySlugModeToAll("full-hierarchy")}>Full path</button>
+          <button className="rounded border px-2 py-0.5 hover:bg-accent" title="Custom namespace + leaf" onClick={() => applySlugModeToAll("manual")}>Custom+leaf</button>
+        </div>
+
         {/* File list */}
         <ScrollArea className="min-h-0 flex-1">
           <div className="px-5 py-2">
@@ -311,13 +354,39 @@ export function BatchIngestDialog({ open, onClose }: Props) {
                   value={file.strategy}
                   onChange={(e) => updateStrategy(file.name, e.target.value as IngestStrategy | "auto")}
                   title={STRATEGY_DESCRIPTIONS[file.strategy]}
-                  className="w-36 rounded-md border border-input bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+                  className="w-32 rounded-md border border-input bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
                 >
                   <option value="auto">Auto</option>
                   <option value="encyclopedia">Encyclopedia</option>
                   <option value="narrative">Narrative</option>
                   <option value="fixed">Fixed</option>
                 </select>
+                {file.strategy === "encyclopedia" && (
+                  <>
+                    <select
+                      value={file.slugMode}
+                      onChange={(e) => updateSlugMode(file.name, e.target.value as SlugMode)}
+                      title="Slug naming mode: how wiki page filenames are generated"
+                      className="w-32 rounded-md border border-input bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+                    >
+                      <option value="default">Slug: leaf only</option>
+                      <option value="title-concept">Slug: doc+leaf</option>
+                      <option value="doc-h1-leaf">Slug: doc+h1+leaf</option>
+                      <option value="doc-h1-h2-leaf">Slug: doc+h1+h2+leaf</option>
+                      <option value="full-hierarchy">Slug: full path</option>
+                      <option value="manual">Slug: custom+leaf</option>
+                    </select>
+                    {file.slugMode === "manual" && (
+                      <input
+                        type="text"
+                        value={file.slugNamespace}
+                        onChange={(e) => updateSlugNamespace(file.name, e.target.value)}
+                        placeholder="namespace (e.g. nani-delle-montagne)"
+                        className="w-40 rounded-md border border-input bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+                      />
+                    )}
+                  </>
+                )}
               </div>
             ))}
           </div>

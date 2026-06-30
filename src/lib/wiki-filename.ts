@@ -28,8 +28,13 @@
  */
 
 /** Produce just the slug — exported for tests / callers that want
- *  to reuse it in places like the index.md wikilink target. */
-export function makeQuerySlug(title: string): string {
+ *  to reuse it in places like the index.md wikilink target.
+ *
+ *  @param maxLength Maximum slug length in characters. Default 50
+ *    (sufficient for most titles and keeps filesystem paths short).
+ *    Pass a higher value for encyclopedia namespace slugs that need
+ *    to preserve long document names. */
+export function makeQuerySlug(title: string, maxLength: number = 50): string {
   const slug = title
     .normalize("NFKC")
     .trim()
@@ -41,7 +46,7 @@ export function makeQuerySlug(title: string): string {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .toLowerCase()
-  const truncated = Array.from(slug).slice(0, 50).join("")
+  const truncated = Array.from(slug).slice(0, maxLength).join("")
   return truncated.length > 0 ? truncated : "query"
 }
 

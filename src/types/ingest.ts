@@ -86,6 +86,43 @@ export interface SectionTypeEntry {
 }
 
 /**
+ * How wiki page slugs are computed for encyclopedia entries.
+ *
+ * - `default` — just the leaf heading title: "rituali"
+ * - `title-concept` — document name (filename without extension) + leaf:
+ *   "compendio-dei-nani-rituali". Best for compendiums where H1 is
+ *   a section (Storia, Biologia) that repeats across documents.
+ * - `doc-h1-leaf` — document name + H1 + leaf:
+ *   "compendio-dei-nani-storia-rituali". Best for compendiums where H1
+ *   is a meaningful section (Storia, Biologia) that should appear in
+ *   the slug for navigation but the document name disambiguates across
+ *   different compendiums.
+ * - `doc-h1-h2-leaf` — document name + H1 + H2 + leaf:
+ *   "compendio-dei-nani-storia-era-antica-origini". Best for deeply
+ *   structured compendiums where H1+H2 provide essential context.
+ * - `full-hierarchy` — entire heading path joined: "nani-cultura-rituali".
+ *   Best for game manuals with deeply nested repeated structures.
+ * - `manual` — a custom namespace string typed by the user + leaf:
+ *   "nani-delle-montagne-rituali". Best when the document structure
+ *   doesn't match the desired namespace and the user knows exactly
+ *   what prefix they want.
+ */
+export type SlugMode = "default" | "title-concept" | "doc-h1-leaf" | "doc-h1-h2-leaf" | "full-hierarchy" | "manual"
+
+/**
+ * Per-file ingest override. Stored in `IngestStrategyConfig.fileOverrides`
+ * keyed by source file basename. When present, the classifier is skipped
+ * and the override strategy + slug mode are used directly.
+ */
+export interface FileIngestOverride {
+  strategy: IngestStrategy
+  /** How to compute slugs for encyclopedia entries. Default: "default". */
+  slugMode?: SlugMode
+  /** Custom namespace for "manual" slug mode. Ignored for other modes. */
+  slugNamespace?: string
+}
+
+/**
  * Persisted user preference for ingest strategy. Lives in the wiki
  * store and is editable from Settings → Ingest Strategy.
  */
@@ -104,12 +141,12 @@ export interface IngestStrategyConfig {
   lastClassification?: ClassificationResult
   /**
    * Per-file strategy overrides. Key = source file name (basename),
-   * value = strategy to use for that file. When a file has an
-   * override, the classifier is skipped entirely and the override
-   * strategy is used directly. This lets the user pre-set strategies
-   * for a batch ingest without monitoring each file.
+   * value = override config. When a file has an override, the
+   * classifier is skipped entirely and the override strategy is
+   * used directly. This lets the user pre-set strategies for a
+   * batch ingest without monitoring each file.
    */
-  fileOverrides?: Record<string, IngestStrategy>
+  fileOverrides?: Record<string, FileIngestOverride>
 }
 
 /**

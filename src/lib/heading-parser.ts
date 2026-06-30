@@ -19,7 +19,7 @@
  */
 import { stripFrontmatter } from "./text-chunker"
 import { makeQuerySlug } from "./wiki-filename"
-import type { HeadingNode, HeadingNodeType } from "@/types/ingest"
+import type { HeadingNode, HeadingNodeType, SlugMode } from "@/types/ingest"
 
 /**
  * Parse a markdown document into a list of heading nodes, each with
@@ -372,48 +372,146 @@ export function countEncyclopediaEntries(
 }
 
 /**
- * Compute the wiki slug for an encyclopedia entry using the
- * "H1 + leaf" rule: the H1 (top-level ancestor) provides the
- * namespace, and the leaf heading (this entry's own title) provides
- * the unique identifier within that namespace.
+ * Maximum slug length for encyclopedia namespace segments. Document
+ * names can be long (e.g. "Compendio dei popoli - I Nani delle
+ * montagne" → 43 chars as slug), so we allow up to 120 chars to avoid
+ * truncation that loses the document identity.
+ */
+const SLUG_MAX_LENGTH = 120
+
+/**
+ * Compute the wiki slug for an encyclopedia entry based on the
+ * configured slug mode.
  *
- * Examples:
- *   headingPath: ["Nani delle Montagne", "Cultura", "Rituali"]
- *   → slug: "nani-delle-montagne-rituali"
+ * Modes:
+ *   - `default` — just the leaf heading: "rituali"
+ *   - `title-concept` — document name + leaf: "compendio-dei-nani-rituali"
+ *   - `doc-h1-leaf` — document name + H1 + leaf
+ *   - `doc-h1-h2-leaf` — document name + H1 + H2 + leaf
+ *   - `full-hierarchy` — entire heading path: "nani-cultura-rituali"
+ *   - `manual` — custom namespace + leaf: "my-ns-rituali"
  *
- *   headingPath: ["Manuale GDR", "Magie", "Palla di Fuoco"]
- *   → slug: "manuale-gdr-palla-di-fuoco"
- *
- * This rule ensures:
- *   1. No cross-document collisions (different H1 → different prefix)
- *   2. No cross-population confusion ("Nani delle Montagne" vs
- *      "Nani delle Pianure" → different H1 → different slug)
- *   3. Readable slugs (only 2 segments, not the full hierarchy)
- *   4. The full hierarchy is preserved in frontmatter `heading_path`,
- *      `parent`, and `ancestor` — the slug doesn't need to encode it
+ * **Duplicate prevention**: if the namespace (or ancestor in full-hierarchy)
+ * equals the leaf title, the duplicate is collapsed.
  *
  * @param node The heading node to compute a slug for
- * @returns kebab-case slug like "nani-delle-montagne-rituali"
+ * @param mode Slug mode (default: "default")
+ * @param documentName Document filename without extension (for "title-concept" mode)
+ * @param customNamespace Custom namespace string (for "manual" mode)
+ * @returns kebab-case slug
  */
-export function computeEncyclopediaSlug(node: HeadingNode): string {
-  const ancestor = node.headingPath[0] ?? node.title
-  const leaf = node.title
-  const ancestorSlug = makeQuerySlug(ancestor)
-  const leafSlug = makeQuerySlug(leaf)
-  return `${ancestorSlug}-${leafSlug}`
+export function computeEncyclopediaSlug(
+  node: HeadingNode,
+  mode: SlugMode = "default",
+  documentName?: string,
+  customNamespace?: string,
+): string {
+  const leafSlug = makeQuerySlug(node.title)
+
+  switch (mode) {
+    case "default":
+      return leafSlug
+
+    case "title-concept": {
+      const ns = makeQuerySlug(documentName ?? node.headingPath[0] ?? node.title, SLUG_MAX_LENGTH)
+      return dedupeSlug(ns, leafSlug)
+    }
+
+    case "doc-h1-leaf": {
+      const docSlug = makeQuerySlug(documentName ?? "", SLUG_MAX_LENGTH)
+      const h1Slug = node.headingPath[0]
+        ? makeQuerySlug(node.headingPath[0], SLUG_MAX_LENGTH)
+        : ""
+      const parts = [docSlug, h1Slug].filter((p) => p && p !== "query")
+      // Remove consecutive duplicates
+      const deduped: string[] = []
+      for (const p of parts) {
+        if (deduped.length === 0 || deduped[deduped.length - 1] !== p) {
+          deduped.push(p)
+        }
+      }
+      if (deduped.length > 0 && deduped[deduped.length - 1] === leafSlug) {
+        return deduped.join("-")
+      }
+      return dedupeSlug(deduped.join("-"), leafSlug)
+    }
+
+    case "doc-h1-h2-leaf": {
+      const docSlug = makeQuerySlug(documentName ?? "", SLUG_MAX_LENGTH)
+      const h1Slug = node.headingPath[0]
+        ? makeQuerySlug(node.headingPath[0], SLUG_MAX_LENGTH)
+        : ""
+      const h2Slug = node.headingPath[1]
+        ? makeQuerySlug(node.headingPath[1], SLUG_MAX_LENGTH)
+        : ""
+      const parts = [docSlug, h1Slug, h2Slug].filter((p) => p && p !== "query")
+      // Remove consecutive duplicates
+      const deduped: string[] = []
+      for (const p of parts) {
+        if (deduped.length === 0 || deduped[deduped.length - 1] !== p) {
+          deduped.push(p)
+        }
+      }
+      if (deduped.length > 0 && deduped[deduped.length - 1] === leafSlug) {
+        return deduped.join("-")
+      }
+      return dedupeSlug(deduped.join("-"), leafSlug)
+    }
+
+    case "full-hierarchy": {
+      const parts = node.headingPath.map((h) => makeQuerySlug(h, SLUG_MAX_LENGTH))
+      // Remove consecutive duplicates and trailing duplicates
+      const deduped: string[] = []
+      for (const p of parts) {
+        if (deduped.length === 0 || deduped[deduped.length - 1] !== p) {
+          deduped.push(p)
+        }
+      }
+      // If the last element equals leafSlug, it's already included
+      if (deduped.length > 0 && deduped[deduped.length - 1] === leafSlug) {
+        return deduped.join("-")
+      }
+      return [...deduped, leafSlug].join("-")
+    }
+
+    case "manual": {
+      const ns = makeQuerySlug(customNamespace ?? "", SLUG_MAX_LENGTH)
+      if (!ns || ns === "query") return leafSlug
+      return dedupeSlug(ns, leafSlug)
+    }
+
+    default:
+      return leafSlug
+  }
+}
+
+/**
+ * Join namespace and leaf, collapsing duplicates. If ns === leaf,
+ * return just leaf (not leaf-leaf).
+ */
+function dedupeSlug(ns: string, leaf: string): string {
+  if (!ns || ns === leaf) return leaf
+  // Also handle case where ns ends with leaf (e.g. ns="nani-rituali", leaf="rituali")
+  if (ns.endsWith(`-${leaf}`)) return ns
+  return `${ns}-${leaf}`
 }
 
 /**
  * Build a map of entry pathKey → suggested slug for all entries in
- * a classification. Used by the generation prompt to pre-compute
- * slugs so the LLM doesn't have to guess (and stays consistent).
+ * a classification, using the specified slug mode.
  */
 export function computeEntrySlugs(
   entries: HeadingNode[],
+  mode: SlugMode = "default",
+  documentName?: string,
+  customNamespace?: string,
 ): Map<string, string> {
   const slugs = new Map<string, string>()
   for (const entry of entries) {
-    slugs.set(entry.pathKey, computeEncyclopediaSlug(entry))
+    slugs.set(
+      entry.pathKey,
+      computeEncyclopediaSlug(entry, mode, documentName, customNamespace),
+    )
   }
   return slugs
 }
