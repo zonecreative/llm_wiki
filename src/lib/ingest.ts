@@ -5,13 +5,14 @@ import {
   getFileModifiedTime,
   getFileSize,
   readFile,
+  readFileAsBase64,
   writeFile,
   listDirectory,
 } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { useWikiStore } from "@/stores/wiki-store"
-import { parseWithMineru } from "@/lib/mineru"
+import { parseWithMineruResult } from "@/lib/mineru"
 import { useChatStore } from "@/stores/chat-store"
 import { useActivityStore } from "@/stores/activity-store"
 import { useReviewStore, type ReviewItem } from "@/stores/review-store"
@@ -42,6 +43,7 @@ import { computeContextBudget } from "@/lib/context-budget"
 import { heuristicClassify } from "@/lib/document-classifier"
 import { parseHeadingTree, countEncyclopediaEntries, classifyHeadings, computeEntrySlugs, computeEncyclopediaSlug } from "@/lib/heading-parser"
 import type { IngestStrategy, ClassificationResult, HeadingNode, SlugMode } from "@/types/ingest"
+import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
@@ -139,6 +141,99 @@ function isSavedImagePromptUrl(projectPath: string, sourceSummarySlug: string, u
 
 function promptImageUrlToAbs(projectPath: string, url: string): string {
   return url.startsWith("media/") ? `${projectPath}/wiki/${url}` : url
+}
+
+function imageMimeTypeFromPath(path: string): string {
+  const ext = getFileName(path).split(".").pop()?.toLowerCase() ?? ""
+  switch (ext) {
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg"
+    case "png":
+      return "image/png"
+    case "gif":
+      return "image/gif"
+    case "webp":
+      return "image/webp"
+    case "bmp":
+      return "image/bmp"
+    case "svg":
+      return "image/svg+xml"
+    case "tif":
+    case "tiff":
+      return "image/tiff"
+    default:
+      return "application/octet-stream"
+  }
+}
+
+async function sha256OfBase64(b64: string): Promise<string> {
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+  const digest = await crypto.subtle.digest("SHA-256", buffer)
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+}
+
+async function savedImagesFromMineruMarkdown(
+  projectPath: string,
+  sourceSummarySlug: string,
+  markdown: string,
+): Promise<SavedImage[]> {
+  const pp = normalizePath(projectPath)
+  const prefix = `media/${sourceSummarySlug}/mineru/`
+  const encodedPrefix = `media/${encodeMarkdownPathSegment(sourceSummarySlug)}/mineru/`
+  const refs: string[] = []
+  const seen = new Set<string>()
+
+  for (const match of markdown.matchAll(/!\[[^\]]*]\(((?:[^()]|\([^()]*\))*)\)/g)) {
+    const rawTarget = (match[1] ?? "").trim()
+    const url = rawTarget.startsWith("<") && rawTarget.includes(">")
+      ? rawTarget.slice(1, rawTarget.indexOf(">"))
+      : rawTarget.split(/\s+["']/)[0]
+    if (!url) continue
+    let decoded = url
+    try {
+      decoded = decodeURIComponent(url)
+    } catch {
+      // Keep the raw URL if it is not valid percent-encoding.
+    }
+    const normalized = normalizePath(decoded.replace(/^\.\//, ""))
+    if (!normalized.startsWith(prefix) && !normalized.startsWith(encodedPrefix)) continue
+    const relPath = normalized.startsWith(encodedPrefix)
+      ? `media/${sourceSummarySlug}/mineru/${normalized.slice(encodedPrefix.length)}`
+      : normalized
+    if (seen.has(relPath)) continue
+    seen.add(relPath)
+    refs.push(relPath)
+  }
+
+  const images: SavedImage[] = []
+  for (const relPath of refs) {
+    const absPath = `${pp}/wiki/${relPath}`
+    try {
+      const { base64 } = await readFileAsBase64(absPath)
+      images.push({
+        index: images.length + 1,
+        mimeType: imageMimeTypeFromPath(relPath),
+        page: null,
+        width: 0,
+        height: 0,
+        relPath,
+        absPath,
+        sha256: await sha256OfBase64(base64),
+      })
+    } catch (err) {
+      console.warn(
+        `[ingest:mineru] failed to read cached MinerU image "${relPath}":`,
+        err instanceof Error ? err.message : err,
+      )
+    }
+  }
+  return images
 }
 
 function stripWikiMediaAbsPaths(projectPath: string, content: string): string {
@@ -487,10 +582,55 @@ export async function autoIngest(
   signal?: AbortSignal,
   folderContext?: string,
   interactive: boolean = true,
+  onFileWritten?: (relativePath: string) => void,
 ): Promise<string[]> {
   return withProjectLock(normalizePath(projectPath), () =>
-    autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext, interactive),
+    autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext, interactive, onFileWritten),
   )
+}
+
+function throwIfIngestAborted(signal: AbortSignal | undefined, activityId?: string): void {
+  if (!signal?.aborted) return
+  if (activityId) {
+    useActivityStore.getState().updateItem(activityId, {
+      status: "error",
+      detail: "Ingest cancelled",
+    })
+  }
+  throw new Error("Ingest cancelled")
+}
+
+export function formatIngestWarningLogEntry(
+  sourceIdentity: string,
+  warnings: readonly string[],
+  at = new Date(),
+): string {
+  return [
+    `## ${at.toISOString()} | ${sourceIdentity}`,
+    "",
+    ...warnings.map((warning, index) => `${index + 1}. ${warning}`),
+    "",
+  ].join("\n")
+}
+
+async function appendIngestWarningLog(
+  projectPath: string,
+  sourceIdentity: string,
+  warnings: readonly string[],
+): Promise<void> {
+  if (warnings.length === 0) return
+  const logPath = `${projectPath}/.llm-wiki/ingest-warnings.log`
+  try {
+    await createDirectory(`${projectPath}/.llm-wiki`)
+    const existing = await tryReadFile(logPath)
+    const next = `${existing.trimEnd()}${existing.trim() ? "\n\n" : ""}${formatIngestWarningLogEntry(sourceIdentity, warnings).trimEnd()}\n`
+    await writeFile(logPath, next)
+  } catch (err) {
+    console.warn(
+      `[ingest] Failed to write ingest warning log for "${sourceIdentity}":`,
+      err instanceof Error ? err.message : err,
+    )
+  }
 }
 
 async function autoIngestImpl(
@@ -500,6 +640,7 @@ async function autoIngestImpl(
   signal?: AbortSignal,
   folderContext?: string,
   interactive: boolean = true,
+  onFileWritten?: (relativePath: string) => void,
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
   const sp = normalizePath(sourcePath)
@@ -522,24 +663,32 @@ async function autoIngestImpl(
   const isPdf = lowerExt === "pdf"
   const mineruCfg = useWikiStore.getState().mineruConfig
   let mineruSucceeded = false
+  let mineruSavedImages: SavedImage[] = []
   if (isPdf && mineruCfg.enabled && mineruCfg.token) {
     try {
       const cacheDir = sp.substring(0, sp.lastIndexOf("/"))
       const cachePath = `${cacheDir}/.cache/${fileName}.txt`
       activity.updateItem(activityId, { detail: "MinerU: parsing PDF..." })
       console.log(`[ingest:mineru] submitting "${fileName}" to MinerU API`)
-      const markdown = await parseWithMineru(mineruCfg, sp, undefined, (msg) => {
+      const mineruResult = await parseWithMineruResult(mineruCfg, sp, undefined, (msg) => {
         activity.updateItem(activityId, { detail: `MinerU: ${msg}` })
       }, signal, {
         projectPath: pp,
         sourceSummarySlug,
       })
       await createDirectory(`${cacheDir}/.cache`)
-      await writeFile(cachePath, markdown)
+      await writeFile(cachePath, mineruResult.markdown)
+      mineruSavedImages = mineruResult.savedImages
+      if (mineruSavedImages.length > 0) {
+        const extractionKey = await imageExtractionKey(pp, sp, sourceSummarySlug)
+        rememberImageExtractionByKey(extractionKey, Promise.resolve(mineruSavedImages))
+      }
       mineruSucceeded = true
-      console.log(`[ingest:mineru] cached MinerU output for "${fileName}" (${markdown.length} chars)`)
+      console.log(
+        `[ingest:mineru] cached MinerU output for "${fileName}" (${mineruResult.markdown.length} chars, images=${mineruSavedImages.length})`,
+      )
     } catch (err) {
-      if (signal?.aborted) throw err
+      throwIfIngestAborted(signal, activityId)
       const msg = trimInlineStatus(err instanceof Error ? err.message : String(err))
       console.warn(`[ingest:mineru] MinerU parsing failed, falling back to pdfium: ${msg}`)
       activity.updateItem(activityId, {
@@ -558,6 +707,13 @@ async function autoIngestImpl(
     tryReadFile(`${pp}/wiki/index.md`),
     tryReadFile(`${pp}/wiki/overview.md`),
   ])
+  if (isPdf && mineruSavedImages.length === 0 && hasMineruImageRefs(sourceContent, sourceSummarySlug)) {
+    mineruSavedImages = await savedImagesFromMineruMarkdown(pp, sourceSummarySlug, sourceContent)
+    if (mineruSavedImages.length > 0) {
+      const extractionKey = await imageExtractionKey(pp, sp, sourceSummarySlug)
+      rememberImageExtractionByKey(extractionKey, Promise.resolve(mineruSavedImages))
+    }
+  }
 
   // ── Heading-aware ingest strategy classification ──
   //
@@ -659,7 +815,7 @@ async function autoIngestImpl(
       console.log(`[ingest:diag] cache-hit branch: starting image extraction for ${sp}`)
       const skipNativePdfImageExtraction = isPdf && hasMineruImageRefs(sourceContent, sourceSummarySlug)
       let savedImages = skipNativePdfImageExtraction
-        ? []
+        ? mineruSavedImages
         : await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
       const markdownImages = await extractAndSaveMarkdownImages(pp, sp, sourceContent, sourceSummarySlug)
       savedImages = [...savedImages, ...markdownImages]
@@ -757,7 +913,7 @@ async function autoIngestImpl(
     hasMineruImageRefs(sourceContent, sourceSummarySlug)
   )
   let savedImages = skipNativePdfImageExtraction
-    ? []
+    ? mineruSavedImages
     : await extractAndSaveSourceImages(pp, sp, sourceSummarySlug)
   const markdownImages = await extractAndSaveMarkdownImages(pp, sp, sourceContent, sourceSummarySlug)
   savedImages = [...savedImages, ...markdownImages]
@@ -905,7 +1061,7 @@ async function autoIngestImpl(
     await streamChat(
       llmConfig,
       [
-        { role: "system", content: buildAnalysisPrompt(purpose, index, sourceContext, ingestStrategy) },
+        { role: "system", content: buildAnalysisPrompt(purpose, index, sourceContext, ingestStrategy, schema) },
         { role: "user", content: `Analyze this source document:\n\n**File:** ${sourceIdentity}${folderContext ? `\n**Folder context:** ${folderContext}` : ""}\n\n---\n\n${sourceContext}` },
       ],
       {
@@ -1366,6 +1522,7 @@ async function autoIngestImpl(
   if (generationActivity?.status === "error") {
     throw new Error(generationActivity.detail || "Generation stream failed")
   }
+  throwIfIngestAborted(signal, activityId)
 
   let reviewSuggestionOutput = ""
   if (!signal?.aborted && shouldRunDedicatedReviewStage(generation)) {
@@ -1407,10 +1564,10 @@ async function autoIngestImpl(
         },
       )
     } catch (err) {
-      if (signal?.aborted) throw err
+      throwIfIngestAborted(signal, activityId)
       console.warn(`[ingest] Review suggestion generation failed for "${sourceIdentity}":`, err)
     }
-    if (signal?.aborted) throw new Error("Ingest cancelled")
+    throwIfIngestAborted(signal, activityId)
     if (reviewStageHadError) reviewSuggestionOutput = ""
   }
 
@@ -1428,6 +1585,7 @@ async function autoIngestImpl(
     hardFailures = allHardFailures
   } else {
     // Standard mode: write all generation output at once
+    throwIfIngestAborted(signal, activityId)
     activity.updateItem(activityId, { detail: "Writing files..." })
     await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
     const writeResult = await writeFileBlocks(
@@ -1437,17 +1595,16 @@ async function autoIngestImpl(
       sourceIdentity,
       sourceSummaryPath,
       signal,
+      activityId,
+      onFileWritten,
     )
+    throwIfIngestAborted(signal, activityId)
     writtenPaths = writeResult.writtenPaths
     writeWarnings = writeResult.warnings
     hardFailures = writeResult.hardFailures
   }
 
   // ── Post-generation drift check (encyclopedia mode) ────────────
-  // Compares the number of concept/entity pages generated against the
-  // number of heading entries available. If the LLM ignored the
-  // "one FILE block per heading" instruction and produced significantly
-  // fewer pages, surface a warning so the user knows entries are missing.
   if (ingestStrategy === "encyclopedia" && headingTree.length > 0) {
     const expectedEntries = countEncyclopediaEntries(headingTree, 1)
     const conceptPaths = writtenPaths.filter((p) =>
@@ -1521,7 +1678,7 @@ async function autoIngestImpl(
           max_tokens: computeIngestReviewMaxTokens(llmConfig.maxContextSize),
         },
       )
-      if (signal?.aborted) throw new Error("Ingest cancelled")
+      throwIfIngestAborted(signal, activityId)
       if (aggregateRepairOutput.trim()) {
         const filteredRepair = filterAggregateRepairOutput(
           aggregateRepairOutput,
@@ -1535,13 +1692,15 @@ async function autoIngestImpl(
           sourceIdentity,
           sourceSummaryPath,
           signal,
+          activityId,
+          onFileWritten,
         )
         writtenPaths.push(...repairResult.writtenPaths)
         writeWarnings.push(...repairResult.warnings)
         hardFailures.push(...repairResult.hardFailures)
       }
     } catch (err) {
-      if (signal?.aborted) throw err
+      throwIfIngestAborted(signal, activityId)
       writeWarnings.push(
         `Aggregate repair failed: ${err instanceof Error ? err.message : String(err)}`,
       )
@@ -1551,12 +1710,14 @@ async function autoIngestImpl(
   // Surface parser / writer warnings to the activity panel so users
   // don't have to open devtools to find out a block was dropped.
   // Keeping the base "Writing files..." detail on top and appending the
-  // first few warnings; full list stays in the console.
+  // first few warnings; full list is also persisted to .llm-wiki.
+  let warningSummary = ""
   if (writeWarnings.length > 0) {
-    const summary = writeWarnings.length === 1
+    await appendIngestWarningLog(pp, sourceIdentity, writeWarnings)
+    warningSummary = writeWarnings.length === 1
       ? writeWarnings[0]
-      : `${writeWarnings.length} ingest warnings: ${writeWarnings.slice(0, 2).join(" · ")}${writeWarnings.length > 2 ? ` … (+${writeWarnings.length - 2} more in console)` : ""}`
-    activity.updateItem(activityId, { detail: summary })
+      : `${writeWarnings.length} ingest warnings: ${writeWarnings.slice(0, 2).join(" · ")}${writeWarnings.length > 2 ? ` … (+${writeWarnings.length - 2} more in .llm-wiki/ingest-warnings.log)` : ""}`
+    activity.updateItem(activityId, { detail: `${warningSummary} — saved to .llm-wiki/ingest-warnings.log` })
   }
 
   // Ensure source summary page exists (LLM may not have generated it correctly)
@@ -1590,6 +1751,7 @@ async function autoIngestImpl(
     try {
       await writeFile(sourceSummaryFullPath, fallbackContent)
       writtenPaths.push(sourceSummaryPath)
+      onFileWritten?.(sourceSummaryPath)
     } catch {
       // non-critical
     }
@@ -1606,15 +1768,14 @@ async function autoIngestImpl(
 
   if (writtenPaths.length > 0) {
     try {
-      const tree = await listDirectory(pp)
-      useWikiStore.getState().setFileTree(tree)
-      useWikiStore.getState().bumpDataVersion()
+      await refreshProjectFileTree(pp, { bumpDataVersion: true })
     } catch {
       // ignore
     }
   }
 
   // ── Step 4: Parse review items ────────────────────────────────
+  throwIfIngestAborted(signal, activityId)
   const reviewItems = [
     ...parseReviewBlocks(generation, sp),
     ...parseReviewBlocks(reviewSuggestionOutput, sp),
@@ -1668,9 +1829,12 @@ async function autoIngestImpl(
     }
   }
 
-  const detail = writtenPaths.length > 0
+  const baseDetail = writtenPaths.length > 0
     ? `${writtenPaths.length} files written${reviewItems.length > 0 ? `, ${reviewItems.length} review item(s)` : ""}`
     : "No files generated"
+  const detail = warningSummary
+    ? `${baseDetail} — ${warningSummary} (saved to .llm-wiki/ingest-warnings.log)`
+    : baseDetail
 
   activity.updateItem(activityId, {
     status: writtenPaths.length > 0 ? "done" : "error",
@@ -2039,6 +2203,8 @@ async function writeFileBlocks(
   sourceFileName: string,
   sourceSummaryPath?: string,
   signal?: AbortSignal,
+  activityId?: string,
+  onFileWritten?: (relativePath: string) => void,
 ): Promise<{ writtenPaths: string[]; warnings: string[]; hardFailures: string[] }> {
   const { blocks, warnings: parseWarnings } = parseFileBlocks(text)
   const warnings = [...parseWarnings]
@@ -2058,6 +2224,7 @@ async function writeFileBlocks(
   const today = currentWikiDate()
 
   for (const { path: rawRelativePath, content: rawContent } of blocks) {
+    throwIfIngestAborted(signal, activityId)
     let relativePath = rawRelativePath
     if (sourceSummaryPath && relativePath.startsWith("wiki/sources/")) {
       relativePath = sourceSummaryPath
@@ -2175,6 +2342,7 @@ async function writeFileBlocks(
         await writeFile(fullPath, toWrite)
       }
       writtenPaths.push(relativePath)
+      onFileWritten?.(relativePath)
     } catch (err) {
       const msg = `Failed to write "${relativePath}": ${err instanceof Error ? err.message : String(err)}`
       console.error(`[ingest] ${msg}`)
@@ -2456,6 +2624,7 @@ export function buildAnalysisPrompt(
   index: string,
   sourceContent: string = "",
   ingestStrategy?: IngestStrategy,
+  schema: string = "",
 ): string {
   const strategyHint = ingestStrategy
     ? buildAnalysisStrategyHint(ingestStrategy)
@@ -2498,6 +2667,7 @@ export function buildAnalysisPrompt(
     "",
     "## Recommendations",
     "- What wiki pages should be created or updated?",
+    "- If the project schema (below) defines page types beyond entity/concept (e.g. goal, habit, reflection, finding, decision, meeting), and the source genuinely contains matching content, recommend pages of those types — name the type explicitly. Only when the source actually supports it; never invent goals/habits/journal entries that aren't in the source.",
     "- What should be emphasized vs. de-emphasized?",
     "- Any open questions worth flagging for the user?",
     "",
@@ -2505,6 +2675,9 @@ export function buildAnalysisPrompt(
     "",
     "If a folder context is provided, use it as a hint for categorization — the folder structure often reflects the user's organizational intent (e.g., 'papers/energy' suggests the file is an energy-related paper).",
     "",
+    schema
+      ? `## Project Schema (page types available — map source content to schema-defined types when it fits)\n${schema}`
+      : "",
     purpose ? `## Wiki Purpose (for context)\n${purpose}` : "",
     index ? `## Current Wiki Index (for checking existing content)\n${index}` : "",
   ].filter(Boolean).join("\n")
@@ -3145,12 +3318,14 @@ function buildChunkAnalysisSystemPrompt(
     "- Concise summary of the main chunk",
     "- New or updated entities",
     "- New or updated concepts",
+    "- Any schema-defined page types beyond entity/concept that the main chunk genuinely supports",
     "- Claims, findings, evidence, contradictions",
     "- Open questions or research gaps",
     "",
     "## Updated Global Digest",
     "A compact document-level digest that incorporates this chunk and preserves prior cross-chunk context.",
-    "Keep this digest structured under: Summary, Entities, Concepts, Claims, Evidence, Contradictions, Open Questions, Cross-Chunk Relations.",
+    "Keep this digest structured under: Summary, Entities, Concepts, Schema-Typed Candidates, Claims, Evidence, Contradictions, Open Questions, Cross-Chunk Relations.",
+    "Use schema-defined types only when the source actually supports them; never invent goals, habits, journal entries, decisions, or similar user-authored records that are not present in the source.",
     "",
     "Stable project context follows. It changes rarely and should be treated as background:",
     purpose ? `## Wiki Purpose\n${purpose}` : "",
@@ -3233,7 +3408,7 @@ async function analyzeLongSourceInChunks(
 
   for (const chunk of chunks) {
     if (chunk.index <= completedThrough) continue
-    if (signal?.aborted) throw new Error("Ingest cancelled")
+    throwIfIngestAborted(signal, activityId)
     activity.updateItem(activityId, {
       detail: `Analyzing long source chunk ${chunk.index}/${chunk.total}...`,
     })
@@ -3266,7 +3441,7 @@ async function analyzeLongSourceInChunks(
       { temperature: 0.1, reasoning: { mode: "off" }, max_tokens: 4096 },
     )
 
-    if (signal?.aborted) throw new Error("Ingest cancelled")
+    throwIfIngestAborted(signal, activityId)
     if (hadError) throw new Error("Chunk analysis stream failed")
 
     const chunkAnalysis = extractMarkedSection(raw, "Chunk Analysis") || raw.trim()
