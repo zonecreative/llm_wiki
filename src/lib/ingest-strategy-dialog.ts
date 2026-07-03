@@ -71,6 +71,7 @@ export function promptIngestStrategy(
         ${strategyButton(classification.strategy, true)}
         ${strategyButton("encyclopedia", false)}
         ${strategyButton("narrative", false)}
+        ${strategyButton("tabular", false)}
         ${strategyButton("fixed", false)}
       </div>
       <button id="ingest-strategy-cancel" style="
@@ -118,6 +119,7 @@ function strategyButton(strategy: string, suggested: boolean): string {
   const labels: Record<string, string> = {
     encyclopedia: "Encyclopedia Mode",
     narrative: "Narrative Mode",
+    tabular: "Tabular / Glossary Mode",
     fixed: "Fixed Chunks (legacy)",
   }
   const label = labels[strategy] ?? strategy

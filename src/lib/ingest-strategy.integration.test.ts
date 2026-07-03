@@ -108,6 +108,27 @@ describe("Romanzo Soeliok — narrative fixture", () => {
   })
 })
 
+// ── Indice Nomi (tabular) ────────────────────────────────────────
+
+describe("Indice Nomi — tabular fixture", () => {
+  const content = loadFixture("indice-nomi-table.md")
+
+  it("is classified as tabular with high confidence", () => {
+    const result = heuristicClassify(content)
+    expect(result.strategy).toBe("tabular")
+    expect(result.confidence).toBeGreaterThanOrEqual(0.8)
+  })
+
+  it("generation prompt includes tabular mode instructions", () => {
+    const prompt = buildGenerationPrompt(
+      "", "", "", "indice-nomi-table.md", "", content, undefined,
+      "tabular", [],
+    )
+    expect(prompt).toContain("Tabular Mode")
+    expect(prompt).toContain("glossary")
+  })
+})
+
 // ── Cache key extension ──────────────────────────────────────────
 
 describe("Ingest cache — strategy-aware key", () => {

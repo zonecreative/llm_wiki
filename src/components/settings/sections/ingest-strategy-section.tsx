@@ -1,14 +1,12 @@
 import { useEffect, useState } from "react"
 import { useTranslation } from "react-i18next"
-import { BookOpen, ScrollText, FileText, Sparkles } from "lucide-react"
+import { BookOpen, ScrollText, FileText, Sparkles, Table2, Layers } from "lucide-react"
 import { useWikiStore } from "@/stores/wiki-store"
 import {
   saveIngestStrategyConfig,
   loadIngestStrategyConfig,
 } from "@/lib/project-store"
-import { heuristicClassify } from "@/lib/document-classifier"
 import type { IngestStrategyConfig } from "@/types/ingest"
-import type { IngestStrategy, ClassificationResult } from "@/types/ingest"
 
 const STRATEGY_OPTIONS: Array<{
   value: IngestStrategyConfig["mode"]
@@ -33,6 +31,18 @@ const STRATEGY_OPTIONS: Array<{
     icon: ScrollText,
     labelKey: "settings.sections.ingestStrategy.modeNarrative",
     descKey: "settings.sections.ingestStrategy.modeNarrativeDesc",
+  },
+  {
+    value: "tabular",
+    icon: Table2,
+    labelKey: "settings.sections.ingestStrategy.modeTabular",
+    descKey: "settings.sections.ingestStrategy.modeTabularDesc",
+  },
+  {
+    value: "mixed",
+    icon: Layers,
+    labelKey: "settings.sections.ingestStrategy.modeMixed",
+    descKey: "settings.sections.ingestStrategy.modeMixedDesc",
   },
   {
     value: "fixed",
@@ -148,31 +158,4 @@ export function IngestStrategySection() {
   )
 }
 
-/**
- * Resolve the effective strategy for a document, combining the user's
- * config preference with the heuristic classifier. Returns the strategy
- * to apply plus the classification result (for logging / UI display).
- *
- * - If mode is explicitly set (not "auto"), returns that strategy
- *   directly with no classification.
- * - If mode is "auto", runs the heuristic classifier. When confidence
- *   >= threshold, applies the result. When confidence < threshold,
- *   returns the suggestion but flags `requiresUserConfirmation`.
- */
-export function resolveIngestStrategy(
-  content: string,
-  config: IngestStrategyConfig,
-): {
-  strategy: IngestStrategy
-  classification?: ClassificationResult
-} {
-  if (config.mode !== "auto") {
-    return { strategy: config.mode }
-  }
-
-  const result = heuristicClassify(content)
-  return {
-    strategy: result.requiresUserConfirmation ? "fixed" : result.strategy,
-    classification: result,
-  }
-}
+export { resolveIngestStrategy } from "@/lib/ingest-strategy-resolver"

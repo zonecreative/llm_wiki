@@ -21,7 +21,7 @@ import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
  *   - The slug computation rule changes
  *   - The parent-child linking logic changes
  */
-export const INGEST_PIPELINE_VERSION = "7"
+export const INGEST_PIPELINE_VERSION = "8"
 
 interface CacheEntry {
   hash: string
@@ -53,10 +53,14 @@ async function sha256(content: string): Promise<string> {
 async function computeCacheHash(
   sourceContent: string,
   ingestStrategy?: string,
+  slugMode?: string,
+  slugNamespace?: string,
 ): Promise<string> {
   const parts = [
     `v=${INGEST_PIPELINE_VERSION}`,
     ingestStrategy ? `strategy=${ingestStrategy}` : "",
+    slugMode ? `slugMode=${slugMode}` : "",
+    slugNamespace ? `slugNs=${slugNamespace}` : "",
     sourceContent,
   ].filter(Boolean)
   return sha256(parts.join("\n"))
@@ -104,12 +108,14 @@ export async function checkIngestCache(
   sourceFileName: string,
   sourceContent: string,
   ingestStrategy?: string,
+  slugMode?: string,
+  slugNamespace?: string,
 ): Promise<string[] | null> {
   const cache = await loadCache(projectPath)
   const entry = cache.entries[sourceFileName]
   if (!entry) return null
 
-  const currentHash = await computeCacheHash(sourceContent, ingestStrategy)
+  const currentHash = await computeCacheHash(sourceContent, ingestStrategy, slugMode, slugNamespace)
   if (entry.hash !== currentHash) return null
 
   const pp = normalizePath(projectPath)
@@ -147,9 +153,11 @@ export async function saveIngestCache(
   sourceContent: string,
   filesWritten: string[],
   ingestStrategy?: string,
+  slugMode?: string,
+  slugNamespace?: string,
 ): Promise<void> {
   const cache = await loadCache(projectPath)
-  const hash = await computeCacheHash(sourceContent, ingestStrategy)
+  const hash = await computeCacheHash(sourceContent, ingestStrategy, slugMode, slugNamespace)
   const newEntries = { ...cache.entries }
   newEntries[sourceFileName] = {
     hash,

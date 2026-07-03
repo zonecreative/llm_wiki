@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, RotateCw } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, RotateCw, RefreshCcw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
@@ -56,6 +56,8 @@ export function SourcesView() {
   const [pendingDeletePath, setPendingDeletePath] = useState<string | null>(null)
   const [reingestingAll, setReingestingAll] = useState(false)
   const [showReingestAllConfirm, setShowReingestAllConfirm] = useState(false)
+  const [reingestAllClean, setReingestAllClean] = useState(false)
+  const [cleanReingestTarget, setCleanReingestTarget] = useState<FileNode | null>(null)
   const [showBatchDialog, setShowBatchDialog] = useState(false)
 
   // Auto-disarm: 5 seconds without a second click resets the
@@ -266,9 +268,6 @@ export function SourcesView() {
 
   async function handleForceReingest(node: FileNode) {
     if (!project || ingestingPath) return
-    // Force re-ingest clears the cache entry for this source and
-    // re-runs the full pipeline. Used when the user wants to apply
-    // a new ingest strategy or re-process after a pipeline fix.
     setIngestingPath(node.path)
     try {
       await forceReingestSource(project, [node.path], llmConfig)
@@ -279,18 +278,30 @@ export function SourcesView() {
     }
   }
 
+  async function handleCleanReingest(node: FileNode) {
+    if (!project || ingestingPath) return
+    setCleanReingestTarget(null)
+    setIngestingPath(node.path)
+    try {
+      await forceReingestSource(project, [node.path], llmConfig, { clean: true })
+    } catch (err) {
+      console.error("Failed to clean re-ingest:", err)
+    } finally {
+      setIngestingPath(null)
+    }
+  }
+
   async function handleReingestAll() {
     if (!project || reingestingAll) return
-    // The confirmation dialog was already shown by the caller; this
-    // function runs after the user confirmed.
     setReingestingAll(true)
     try {
-      await forceReingestAllSources(project, llmConfig)
+      await forceReingestAllSources(project, llmConfig, { clean: reingestAllClean })
     } catch (err) {
       console.error("Failed to re-ingest all sources:", err)
     } finally {
       setReingestingAll(false)
       setShowReingestAllConfirm(false)
+      setReingestAllClean(false)
     }
   }
 
@@ -385,6 +396,7 @@ export function SourcesView() {
               onOpen={handleOpenSource}
               onIngest={handleIngest}
               onForceReingest={handleForceReingest}
+              onCleanReingest={(node) => setCleanReingestTarget(node)}
               onDelete={handleDelete}
               onDeleteFolder={handleDeleteFolder}
               pendingDeletePath={pendingDeletePath}
@@ -443,9 +455,18 @@ export function SourcesView() {
                 defaultValue:
                   "This will clear the ingest cache for ALL source files and re-run the full ingest pipeline. " +
                   "This may take a long time and will use LLM tokens for every file. " +
-                  "Wiki pages will be merged with existing content. Continue?",
+                  "Wiki pages will be merged with existing content unless you enable clean re-ingest below. Continue?",
               })}
             </p>
+            <label className="mb-4 flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={reingestAllClean}
+                onChange={(e) => setReingestAllClean(e.target.checked)}
+              />
+              <span>{t("sources.reingestAllClean")}</span>
+            </label>
             <div className="flex justify-end gap-2">
               <Button variant="outline" onClick={() => setShowReingestAllConfirm(false)}>
                 {t("sources.cancel", { defaultValue: "Cancel" })}
@@ -463,6 +484,47 @@ export function SourcesView() {
                   <>
                     <RotateCw className="mr-1.5 h-4 w-4" />
                     {t("sources.reingestAll", { defaultValue: "Re-ingest All" })}
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {cleanReingestTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+          onClick={() => setCleanReingestTarget(null)}
+        >
+          <div
+            className="mx-4 max-w-md rounded-lg border border-border bg-background p-6 shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center gap-2">
+              <RefreshCcw className="h-5 w-5 text-primary" />
+              <h3 className="text-lg font-semibold">{t("sources.cleanReingestTitle")}</h3>
+            </div>
+            <p className="mb-4 text-sm text-muted-foreground">
+              {t("sources.cleanReingestConfirm", { name: cleanReingestTarget.name })}
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setCleanReingestTarget(null)}>
+                {t("sources.cancel", { defaultValue: "Cancel" })}
+              </Button>
+              <Button
+                onClick={() => handleCleanReingest(cleanReingestTarget)}
+                disabled={ingestingPath === cleanReingestTarget.path}
+              >
+                {ingestingPath === cleanReingestTarget.path ? (
+                  <>
+                    <RefreshCcw className="mr-1.5 h-4 w-4 animate-spin" />
+                    {t("sources.cleanReingesting")}
+                  </>
+                ) : (
+                  <>
+                    <RefreshCcw className="mr-1.5 h-4 w-4" />
+                    {t("sources.cleanReingest")}
                   </>
                 )}
               </Button>
@@ -519,6 +581,7 @@ function SourceTree({
   onOpen,
   onIngest,
   onForceReingest,
+  onCleanReingest,
   onDelete,
   onDeleteFolder,
   pendingDeletePath,
@@ -529,6 +592,7 @@ function SourceTree({
   onOpen: (node: FileNode) => void
   onIngest: (node: FileNode) => void
   onForceReingest: (node: FileNode) => void
+  onCleanReingest: (node: FileNode) => void
   onDelete: (node: FileNode) => void
   onDeleteFolder: (node: FileNode) => void
   /** Path of the node currently in "click again to confirm" state.
@@ -660,11 +724,21 @@ function SourceTree({
               variant="ghost"
               size="icon"
               className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
-              title={t("sources.forceReingest", { defaultValue: "Force Re-ingest (clear cache + re-run)" })}
+              title={t("sources.forceReingest")}
               disabled={ingestingPath === node.path}
               onClick={() => onForceReingest(node)}
             >
               <RotateCw className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
+              title={t("sources.cleanReingest")}
+              disabled={ingestingPath === node.path}
+              onClick={() => onCleanReingest(node)}
+            >
+              <RefreshCcw className="h-4 w-4" />
             </Button>
             <DeleteButton
               isPending={isPendingDelete}

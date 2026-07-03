@@ -40,9 +40,63 @@ import { captionMarkdownImages, loadCaptionCache } from "@/lib/image-caption-pip
 import type { MultimodalConfig } from "@/stores/wiki-store"
 import { GENERATION_WIKI_TYPES } from "@/lib/wiki-page-types"
 import { computeContextBudget } from "@/lib/context-budget"
-import { heuristicClassify } from "@/lib/document-classifier"
+import {
+  normalizeFileOverride,
+  resolveIngestStrategy,
+} from "@/lib/ingest-strategy-resolver"
 import { parseHeadingTree, countEncyclopediaEntries, classifyHeadings, computeEntrySlugs, computeEncyclopediaSlug } from "@/lib/heading-parser"
-import type { IngestStrategy, ClassificationResult, HeadingNode, SlugMode } from "@/types/ingest"
+import { parseMarkdownTableRows, type ParsedTableRow } from "@/lib/table-structure-parser"
+import {
+  chunkTabularRows,
+  filterGeneratableTabularRows,
+  collectAliasOnlyRows,
+  buildAliasReviewBlock,
+  TABULAR_BATCH_SIZE,
+  buildTabularBatchSystemPrompt,
+  buildTabularAggregateSystemPrompt,
+  buildTabularBatchUserMessage,
+} from "@/lib/tabular-ingest"
+import { buildMixedIngestPlan } from "@/lib/mixed-ingest"
+import {
+  validateSourceSummaryHub,
+  findUndesiredChapterPages,
+  SOURCE_SUMMARY_MIN_WIKILINKS,
+} from "@/lib/ingest-validation"
+import type { IngestStrategy, ClassificationResult, HeadingNode, SlugMode, SectionTypeEntry } from "@/types/ingest"
+import { CLASSIFIER_CONFIDENCE_THRESHOLD } from "@/types/ingest"
+import {
+  announceIngestPlan,
+  clearIngestProgress,
+  formatIngestDoneDetail,
+  ingestCaptioningImages,
+  ingestEncAggregate,
+  ingestEncBatchGenerate,
+  ingestEncBatchWrite,
+  ingestEncGapFill,
+  ingestEncResume,
+  ingestErrorDetail,
+  ingestExtractingImages,
+  ingestLongSourceChunk,
+  ingestLongSourceResume,
+  ingestMineruFallback,
+  ingestMineruParsing,
+  ingestMineruProgress,
+  ingestCancelledDetail,
+  ingestReadingSource,
+  ingestRepairAggregates,
+  ingestSkippedUnchanged,
+  ingestStep1,
+  ingestStep2,
+  ingestTabAggregate,
+  ingestTabBatchGenerate,
+  ingestTabBatchWrite,
+  ingestTabResume,
+  ingestWritingFiles,
+  ingestWriteWarnings,
+  warnChapterPages,
+  warnDrift,
+  warnSourceHub,
+} from "@/lib/ingest-progress"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 
 const LONG_SOURCE_MIN_BUDGET = 8_000
@@ -594,7 +648,7 @@ function throwIfIngestAborted(signal: AbortSignal | undefined, activityId?: stri
   if (activityId) {
     useActivityStore.getState().updateItem(activityId, {
       status: "error",
-      detail: "Ingest cancelled",
+      detail: ingestCancelledDetail(),
     })
   }
   throw new Error("Ingest cancelled")
@@ -654,9 +708,10 @@ async function autoIngestImpl(
     type: "ingest",
     title: fileName,
     status: "running",
-    detail: "Reading source...",
+    detail: "",
     filesWritten: [],
   })
+  ingestReadingSource(activityId)
 
   // ── MinerU preprocessing for PDF files ──
   const lowerExt = fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() : ""
@@ -668,10 +723,10 @@ async function autoIngestImpl(
     try {
       const cacheDir = sp.substring(0, sp.lastIndexOf("/"))
       const cachePath = `${cacheDir}/.cache/${fileName}.txt`
-      activity.updateItem(activityId, { detail: "MinerU: parsing PDF..." })
+      ingestMineruParsing(activityId)
       console.log(`[ingest:mineru] submitting "${fileName}" to MinerU API`)
       const mineruResult = await parseWithMineruResult(mineruCfg, sp, undefined, (msg) => {
-        activity.updateItem(activityId, { detail: `MinerU: ${msg}` })
+        ingestMineruProgress(activityId, msg)
       }, signal, {
         projectPath: pp,
         sourceSummarySlug,
@@ -691,12 +746,10 @@ async function autoIngestImpl(
       throwIfIngestAborted(signal, activityId)
       const msg = trimInlineStatus(err instanceof Error ? err.message : String(err))
       console.warn(`[ingest:mineru] MinerU parsing failed, falling back to pdfium: ${msg}`)
-      activity.updateItem(activityId, {
-        detail: `MinerU failed, falling back to built-in PDF extraction: ${msg}`,
-      })
+      ingestMineruFallback(activityId, msg)
     }
     if (mineruSucceeded && !signal?.aborted) {
-      activity.updateItem(activityId, { detail: "Reading source..." })
+      ingestReadingSource(activityId)
     }
   }
 
@@ -729,56 +782,52 @@ async function autoIngestImpl(
   //   3. The long-source checkpoint validity
   //   4. Post-generation drift check (encyclopedia: FILE blocks vs headings)
   const ingestStrategyConfig = useWikiStore.getState().ingestStrategyConfig
-  let ingestStrategy: IngestStrategy = "fixed"
-  let classification: ClassificationResult | undefined
   let headingTree: HeadingNode[] = []
 
-  // ── Per-file override check ──
-  // If the user pre-set a strategy for this specific file (via the
-  // batch ingest dialog), use it directly — skip the classifier
-  // and the confirmation dialog entirely.
-  const rawOverride = ingestStrategyConfig.fileOverrides?.[fileName]
-  // Backward compat: old overrides were plain strings (just the strategy).
-  // New overrides are objects with strategy + slugMode + slugNamespace.
-  const fileOverride = typeof rawOverride === "string"
-    ? { strategy: rawOverride as IngestStrategy }
-    : rawOverride
+  const fileOverride = normalizeFileOverride(ingestStrategyConfig.fileOverrides?.[fileName])
   const fileSlugMode: SlugMode = fileOverride?.slugMode ?? "default"
   const fileSlugNamespace = fileOverride?.slugNamespace
 
-  if (fileOverride) {
-    ingestStrategy = fileOverride.strategy
-    console.log(`[ingest:strategy] using per-file override "${fileOverride.strategy}" (slug: ${fileSlugMode}) for "${fileName}"`)
-  } else if (ingestStrategyConfig.mode === "auto") {
-    classification = heuristicClassify(sourceContent)
-    if (classification.requiresUserConfirmation && interactive) {
-      // Low confidence + interactive context — ask the user (Level 4).
-      // In non-interactive contexts (watch folder, scheduled import,
-      // batch ingest with pre-set overrides), use the classifier's
-      // best guess silently to avoid blocking the queue.
-      try {
-        const { promptIngestStrategy } = await import("@/lib/ingest-strategy-dialog")
-        ingestStrategy = await promptIngestStrategy(classification, fileName)
-      } catch {
-        ingestStrategy = classification.strategy
-      }
-    } else {
-      // Either high confidence (apply directly) or non-interactive
-      // (use best guess without asking).
+  const resolution = resolveIngestStrategy({
+    content: sourceContent,
+    config: ingestStrategyConfig,
+    fileName,
+    interactive,
+  })
+
+  let ingestStrategy: IngestStrategy = resolution.strategy
+  const classification: ClassificationResult | undefined = resolution.classification
+
+  if (resolution.source === "file-override" && fileOverride) {
+    console.log(
+      `[ingest:strategy] using per-file override "${fileOverride.strategy}" (slug: ${fileSlugMode}) for "${fileName}"`,
+    )
+  } else if (resolution.requiresUserPrompt && classification) {
+    try {
+      const { promptIngestStrategy } = await import("@/lib/ingest-strategy-dialog")
+      ingestStrategy = await promptIngestStrategy(classification, fileName)
+    } catch {
       ingestStrategy = classification.strategy
-      if (classification.requiresUserConfirmation && !interactive) {
-        console.log(
-          `[ingest:strategy] low confidence (${Math.round(classification.confidence * 100)}%) for "${fileName}" — using ${classification.strategy} silently (non-interactive context)`,
-        )
-      }
     }
-    // Persist the last classification so the UI can display reasoning
+  } else if (resolution.source === "classifier-conservative-fallback" && classification) {
+    console.log(
+      `[ingest:strategy] low confidence (${Math.round(classification.confidence * 100)}%) for "${fileName}" — fallback to fixed (non-interactive)`,
+    )
+  } else if (
+    classification &&
+    classification.confidence < CLASSIFIER_CONFIDENCE_THRESHOLD &&
+    !interactive
+  ) {
+    console.log(
+      `[ingest:strategy] low confidence (${Math.round(classification.confidence * 100)}%) for "${fileName}" — using ${ingestStrategy} silently (non-interactive context)`,
+    )
+  }
+
+  if (classification && ingestStrategyConfig.mode === "auto" && !fileOverride) {
     useWikiStore.getState().setIngestStrategyConfig({
       ...ingestStrategyConfig,
       lastClassification: classification,
     })
-  } else {
-    ingestStrategy = ingestStrategyConfig.mode
   }
 
   // Pre-parse the heading tree for encyclopedia mode. The generation
@@ -794,9 +843,31 @@ async function autoIngestImpl(
     console.log(
       `[ingest:strategy] narrative mode — ${headingTree.length} chapter boundaries detected`,
     )
+  } else if (ingestStrategy === "tabular") {
+    const tabularRowCount = parseMarkdownTableRows(sourceContent).length
+    console.log(`[ingest:strategy] tabular mode — ${tabularRowCount} table rows parsed`)
   } else {
     console.log(`[ingest:strategy] ${ingestStrategy} mode (no heading parsing)`)
   }
+
+  let planSource: "override" | "classifier" | "fallback" | "forced" = "forced"
+  if (resolution.source === "file-override") planSource = "override"
+  else if (resolution.source === "classifier-conservative-fallback") planSource = "fallback"
+  else if (resolution.source === "classifier") planSource = "classifier"
+
+  const earlyTabularRows =
+    ingestStrategy === "tabular" ? parseMarkdownTableRows(sourceContent).length : 0
+  announceIngestPlan(activityId, {
+    strategy: ingestStrategy,
+    source: planSource,
+    confidence: classification?.confidence,
+    encyclopediaEntries:
+      ingestStrategy === "encyclopedia" ? countEncyclopediaEntries(headingTree, 1) : 0,
+    narrativeChapters:
+      ingestStrategy === "narrative" ? headingTree.length : 0,
+    tabularRows: earlyTabularRows,
+    tabularBatches: earlyTabularRows > 0 ? Math.ceil(earlyTabularRows / TABULAR_BATCH_SIZE) : 0,
+  })
 
   // ── Cache check: skip re-ingest if source content hasn't changed ──
   //
@@ -808,7 +879,14 @@ async function autoIngestImpl(
   // re-running them costs only the extraction time and converges the
   // source-summary page on the current pipeline's contract regardless
   // of when the file was first ingested.
-  const cachedFiles = await checkIngestCache(pp, sourceIdentity, sourceContent, ingestStrategy)
+  const cachedFiles = await checkIngestCache(
+    pp,
+    sourceIdentity,
+    sourceContent,
+    ingestStrategy,
+    fileSlugMode,
+    fileSlugNamespace,
+  )
   console.log(`[ingest:diag] cache check for "${sourceIdentity}":`, cachedFiles === null ? "MISS (full pipeline)" : `HIT (${cachedFiles.length} cached files)`)
   if (cachedFiles !== null) {
     try {
@@ -852,10 +930,7 @@ async function autoIngestImpl(
                   isSavedImagePromptUrl(pp, sourceSummarySlug, url),
                 urlToAbsPath: (url) => promptImageUrlToAbs(pp, url),
                 concurrency: mmCfg.concurrency,
-                onProgress: (done, total) =>
-                  activity.updateItem(activityId, {
-                    detail: `Captioning images... ${done}/${total}`,
-                  }),
+                onProgress: (done, total) => ingestCaptioningImages(activityId, done, total),
               })
             } catch (err) {
               console.warn(
@@ -882,11 +957,13 @@ async function autoIngestImpl(
         err instanceof Error ? err.message : err,
       )
     }
+    ingestSkippedUnchanged(activityId, cachedFiles.length)
     activity.updateItem(activityId, {
       status: "done",
-      detail: `Skipped (unchanged) — ${cachedFiles.length} files from previous ingest`,
+      detail: formatIngestDoneDetail(cachedFiles.length, 0, undefined, activityId),
       filesWritten: cachedFiles,
     })
+    clearIngestProgress(activityId)
     return cachedFiles
   }
 
@@ -907,7 +984,7 @@ async function autoIngestImpl(
   //
   // Failure here is never fatal — extractAndSaveSourceImages logs
   // and returns [] on any error.
-  activity.updateItem(activityId, { detail: "Extracting embedded images..." })
+  ingestExtractingImages(activityId)
   console.log(`[ingest:diag] full-pipeline branch: starting image extraction for ${sp}`)
   const skipNativePdfImageExtraction = isPdf && (
     hasMineruImageRefs(sourceContent, sourceSummarySlug)
@@ -985,7 +1062,7 @@ async function autoIngestImpl(
     savedImages.length > 0 &&
     /!\[\]\(/.test(enrichedSourceContent)
   ) {
-    activity.updateItem(activityId, { detail: "Captioning images..." })
+    ingestCaptioningImages(activityId)
     const ourMediaPrefix = `${pp}/wiki/media/${sourceSummarySlug}/`
     try {
       const result = await captionMarkdownImages(pp, enrichedSourceContent, captionLlm, {
@@ -998,10 +1075,7 @@ async function autoIngestImpl(
         shouldCaption: (url) => url.startsWith(ourMediaPrefix) || isSavedImagePromptUrl(pp, sourceSummarySlug, url),
         urlToAbsPath: (url) => promptImageUrlToAbs(pp, url),
         concurrency: mmCfg.concurrency,
-        onProgress: (done, total) =>
-          activity.updateItem(activityId, {
-            detail: `Captioning images... ${done}/${total}`,
-          }),
+        onProgress: (done, total) => ingestCaptioningImages(activityId, done, total),
       })
       enrichedSourceContent = stripWikiMediaAbsPaths(pp, result.enrichedMarkdown)
       console.log(
@@ -1038,6 +1112,7 @@ async function autoIngestImpl(
       activityId,
       signal,
       ingestStrategy,
+      headingTree,
     )
     if (longSourcePlan.chunked) {
       sourceContext = longSourcePlan.sourceContext
@@ -1049,11 +1124,7 @@ async function autoIngestImpl(
   // ── Step 1: Analysis ──────────────────────────────────────────
   // LLM reads the source and produces a structured analysis:
   // key entities, concepts, main arguments, connections to existing wiki, contradictions
-  activity.updateItem(activityId, {
-    detail: precomputedAnalysis
-      ? "Step 1/2: Consolidating long-source analysis..."
-      : "Step 1/2: Analyzing source...",
-  })
+  ingestStep1(activityId, Boolean(precomputedAnalysis))
 
   let analysis = precomputedAnalysis
 
@@ -1068,7 +1139,10 @@ async function autoIngestImpl(
         onToken: (token) => { analysis += token },
         onDone: () => {},
         onError: (err) => {
-          activity.updateItem(activityId, { status: "error", detail: `Analysis failed: ${err.message}` })
+          activity.updateItem(activityId, {
+            status: "error",
+            detail: ingestErrorDetail("analysis", err.message),
+          })
         },
       },
       signal,
@@ -1086,7 +1160,6 @@ async function autoIngestImpl(
 
   // ── Step 2: Generation ────────────────────────────────────────
   // LLM takes the analysis as context and produces wiki files + review items
-  activity.updateItem(activityId, { detail: "Step 2/2: Generating wiki pages..." })
 
   // Accumulators for review items and aggregate repair across batches
   let allReviewItems = ""
@@ -1108,6 +1181,11 @@ async function autoIngestImpl(
   //      or is cancelled, the next run resumes from where it left off.
   const MAX_BATCH_ENTRIES = 20
   let encyclopediaBatches: HeadingNode[][] = []
+  let tabularBatches: ParsedTableRow[][] = []
+  let tabularRows: ParsedTableRow[] = []
+  let tabularAliasRows: ParsedTableRow[] = []
+  let mixedSectionMap: SectionTypeEntry[] | undefined
+
   if (ingestStrategy === "encyclopedia" && headingTree.length > 0) {
     const classification = classifyHeadings(headingTree, 1)
     if (classification.entries.length > MAX_BATCH_ENTRIES) {
@@ -1118,7 +1196,71 @@ async function autoIngestImpl(
     }
   }
 
+  if (ingestStrategy === "tabular") {
+    const allParsedRows = parseMarkdownTableRows(sourceContent)
+    tabularRows = filterGeneratableTabularRows(allParsedRows)
+    tabularAliasRows = collectAliasOnlyRows(allParsedRows)
+    if (tabularRows.length > 0) {
+      tabularBatches = chunkTabularRows(tabularRows)
+      console.log(
+        `[ingest:strategy] tabular batch generation: ${tabularRows.length} rows → ${tabularBatches.length} batches`,
+      )
+    }
+  }
+
+  if (ingestStrategy === "mixed") {
+    const mixedPlan = buildMixedIngestPlan(sourceContent)
+    mixedSectionMap = mixedPlan.sectionMap
+    console.log(
+      `[ingest:strategy] mixed mode — ${mixedPlan.sections.length} sections: ${mixedPlan.sectionMap.map((s) => `${s.headingTitle}=${s.strategy}`).join(", ")}`,
+    )
+    for (const section of mixedPlan.sections) {
+      if (section.strategy === "tabular") {
+        const sectionRows = parseMarkdownTableRows(section.content)
+        tabularRows.push(...filterGeneratableTabularRows(sectionRows))
+        tabularAliasRows.push(...collectAliasOnlyRows(sectionRows))
+      } else if (section.strategy === "encyclopedia") {
+        headingTree.push(...parseHeadingTree(section.content))
+      } else if (section.strategy === "narrative") {
+        headingTree.push(...parseHeadingTree(section.content, "narrative-boundary"))
+      }
+    }
+    if (tabularRows.length > 0) {
+      tabularBatches = chunkTabularRows(tabularRows)
+    }
+    if (headingTree.length > 0) {
+      const classification = classifyHeadings(headingTree, 1)
+      if (classification.entries.length > MAX_BATCH_ENTRIES) {
+        encyclopediaBatches = chunkArray(classification.entries, MAX_BATCH_ENTRIES)
+      }
+    }
+  }
+
+  const encEntriesForPlan =
+    headingTree.length > 0 ? classifyHeadings(headingTree, 1).entries.length : 0
+  const narrativeChaptersForPlan =
+    ingestStrategy === "narrative" || ingestStrategy === "mixed"
+      ? headingTree.filter((n) => n.nodeType === "narrative-boundary").length
+      : 0
+
+  announceIngestPlan(activityId, {
+    strategy: ingestStrategy,
+    source: planSource,
+    confidence: classification?.confidence,
+    encyclopediaEntries: encEntriesForPlan,
+    encyclopediaBatches: encyclopediaBatches.length,
+    narrativeChapters: narrativeChaptersForPlan,
+    tabularRows: tabularRows.length,
+    tabularBatches: tabularBatches.length,
+    mixedSections: mixedSectionMap,
+  })
+
+  ingestStep2(activityId)
+
+  let usedBatchGeneration = false
+
   if (encyclopediaBatches.length > 0) {
+    usedBatchGeneration = true
     // ── Batch mode: generate + write each batch independently ──
     await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
 
@@ -1146,9 +1288,7 @@ async function autoIngestImpl(
         console.log(
           `[ingest:strategy] resuming encyclopedia batch from ${completedBatches}/${encyclopediaBatches.length} (${allWrittenPaths.length} files already written)`,
         )
-        activity.updateItem(activityId, {
-          detail: `Resuming from batch ${completedBatches + 1}/${encyclopediaBatches.length}...`,
-        })
+        ingestEncResume(activityId, completedBatches + 1, encyclopediaBatches.length)
       }
     } catch {
       // No checkpoint — start from scratch
@@ -1157,9 +1297,7 @@ async function autoIngestImpl(
     for (let i = completedBatches; i < encyclopediaBatches.length; i++) {
       if (signal?.aborted) throw new Error("Ingest cancelled")
       const batch = encyclopediaBatches[i]
-      activity.updateItem(activityId, {
-        detail: `Generating wiki pages... batch ${i + 1}/${encyclopediaBatches.length} (${batch.length} entries)`,
-      })
+      ingestEncBatchGenerate(activityId, i + 1, encyclopediaBatches.length, batch.length)
 
       // Build the user message with ACTUAL CONTENT of each entry.
       // This is the key difference from the old approach: instead of
@@ -1239,7 +1377,10 @@ async function autoIngestImpl(
           onToken: (token) => { batchGeneration += token },
           onDone: () => {},
           onError: (err) => {
-            activity.updateItem(activityId, { status: "error", detail: `Generation batch ${i + 1} failed: ${err.message}` })
+            activity.updateItem(activityId, {
+              status: "error",
+              detail: ingestErrorDetail("batch", err.message, i + 1),
+            })
           },
         },
         signal,
@@ -1263,9 +1404,7 @@ async function autoIngestImpl(
       }
 
       // ── Write this batch immediately ──
-      activity.updateItem(activityId, {
-        detail: `Writing batch ${i + 1}/${encyclopediaBatches.length}...`,
-      })
+      ingestEncBatchWrite(activityId, i + 1, encyclopediaBatches.length)
 
       const batchWriteResult = await writeFileBlocks(
         pp,
@@ -1359,9 +1498,7 @@ async function autoIngestImpl(
         }
 
         if (missingEntries.length > 0) {
-          activity.updateItem(activityId, {
-            detail: `Gap fill: generating ${missingEntries.length} missing parent page(s)...`,
-          })
+          ingestEncGapFill(activityId, missingEntries.length)
 
           const gapEntryContents = missingEntries.map(({ slug, node }) => {
             return [
@@ -1469,10 +1606,241 @@ async function autoIngestImpl(
       }
     }
 
+    // Aggregate pass for batch mode: source summary, index, overview, log
+    if (!signal?.aborted && sourceSummaryPath) {
+      ingestEncAggregate(activityId)
+      let encAggregate = ""
+      const entrySlugs = [...computeEntrySlugs(classifyHeadings(headingTree, 1).entries, fileSlugMode, fileName.replace(/\.[^.]+$/, ""), fileSlugNamespace).values()]
+      await streamChat(
+        llmConfig,
+        [
+          {
+            role: "system",
+            content: [
+              "Generate aggregate FILE blocks for encyclopedia batch ingest.",
+              `Source: ${sourceIdentity}`,
+              `Source summary: ${sourceSummaryPath}`,
+              "Include index, overview, log updates and a rich source summary.",
+              "Source summary body MUST contain at least 5 [[wikilink]] to major entries.",
+              `Sample slugs: ${entrySlugs.slice(0, 15).join(", ")}`,
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: "Emit aggregate FILE blocks now. Start with ---FILE:.",
+          },
+        ],
+        {
+          onToken: (token) => { encAggregate += token },
+          onDone: () => {},
+          onError: (err) => {
+            console.warn(`[ingest:strategy] encyclopedia aggregate failed: ${err.message}`)
+          },
+        },
+        signal,
+        {
+          temperature: 0.1,
+          reasoning: { mode: "off" },
+          max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
+        },
+      )
+      if (encAggregate.trim()) {
+        const aggResult = await writeFileBlocks(
+          pp,
+          encAggregate,
+          llmConfig,
+          sourceIdentity,
+          sourceSummaryPath,
+          signal,
+        )
+        allWrittenPaths.push(...aggResult.writtenPaths)
+        allWriteWarnings.push(...aggResult.warnings)
+        allHardFailures.push(...aggResult.hardFailures)
+        allReviewItems += encAggregate
+      }
+    }
+
     // Use the accumulated review items for the review stage
     generation = allReviewItems
-  } else {
-    // Standard mode: single LLM call
+  }
+
+  if (tabularBatches.length > 0) {
+    usedBatchGeneration = true
+    await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
+
+    const allSlugs = tabularRows.map((r) => r.slug)
+    const sourceHash = hashTextHex(sourceContent)
+    batchCheckpointPath = `${pp}/.llm-wiki/ingest-progress/tab-batch-${sourceSummarySlug}-${sourceHash}.json`
+    let completedBatches = 0
+
+    try {
+      const raw = await readFile(batchCheckpointPath)
+      const cp = JSON.parse(raw) as {
+        sourceIdentity: string
+        totalBatches: number
+        completedThrough: number
+        writtenPaths: string[]
+      }
+      if (
+        cp.sourceIdentity === sourceIdentity &&
+        cp.totalBatches === tabularBatches.length &&
+        cp.completedThrough >= 0 &&
+        cp.completedThrough <= tabularBatches.length
+      ) {
+        completedBatches = cp.completedThrough
+        allWrittenPaths = [...cp.writtenPaths]
+        console.log(
+          `[ingest:strategy] resuming tabular batch from ${completedBatches}/${tabularBatches.length}`,
+        )
+        ingestTabResume(activityId, completedBatches + 1, tabularBatches.length)
+      }
+    } catch {
+      // No checkpoint
+    }
+
+    const batchSystemPrompt = buildTabularBatchSystemPrompt({
+      sourceIdentity,
+      sourceSummaryPath,
+      schema,
+      purpose,
+      index,
+      allSlugs,
+      sourceContent,
+      outputLanguage: useWikiStore.getState().outputLanguage,
+    })
+
+    for (let i = completedBatches; i < tabularBatches.length; i++) {
+      if (signal?.aborted) throw new Error("Ingest cancelled")
+      const batch = tabularBatches[i]
+      ingestTabBatchGenerate(activityId, i + 1, tabularBatches.length, batch.length)
+
+      let batchGeneration = ""
+      await streamChat(
+        llmConfig,
+        [
+          { role: "system", content: batchSystemPrompt },
+          {
+            role: "user",
+            content: buildTabularBatchUserMessage(
+              batch,
+              analysis,
+              useWikiStore.getState().outputLanguage,
+            ),
+          },
+        ],
+        {
+          onToken: (token) => { batchGeneration += token },
+          onDone: () => {},
+          onError: (err) => {
+            console.warn(`[ingest:strategy] tabular batch ${i + 1} failed: ${err.message}`)
+          },
+        },
+        signal,
+        {
+          temperature: 0.1,
+          reasoning: { mode: "off" },
+          max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
+        },
+      )
+
+      if (batchGeneration.trim()) {
+        ingestTabBatchWrite(activityId, i + 1, tabularBatches.length)
+        const batchWriteResult = await writeFileBlocks(
+          pp,
+          batchGeneration,
+          llmConfig,
+          sourceIdentity,
+          sourceSummaryPath,
+          signal,
+          activityId,
+        )
+        allWrittenPaths.push(...batchWriteResult.writtenPaths)
+        allWriteWarnings.push(...batchWriteResult.warnings)
+        allHardFailures.push(...batchWriteResult.hardFailures)
+        allReviewItems += batchGeneration
+      }
+
+      await saveEncyclopediaBatchCheckpoint(batchCheckpointPath, {
+        sourceIdentity,
+        totalBatches: tabularBatches.length,
+        completedThrough: i + 1,
+        writtenPaths: allWrittenPaths,
+      })
+    }
+
+    await clearEncyclopediaBatchCheckpoint(batchCheckpointPath)
+
+    // Aggregate pass: source summary hub, index, overview, log
+    ingestTabAggregate(activityId)
+    let aggregateGeneration = ""
+    const topSlugs = allSlugs.slice(0, 20)
+    await streamChat(
+      llmConfig,
+      [
+        {
+          role: "system",
+          content: buildTabularAggregateSystemPrompt({
+            sourceIdentity,
+            sourceSummaryPath,
+            entryCount: tabularRows.length,
+            topSlugs,
+            sourceContent,
+          }),
+        },
+        {
+          role: "user",
+          content: [
+            `Generate aggregate FILE blocks for glossary source **${sourceIdentity}**.`,
+            `Include source summary at ${sourceSummaryPath} with rich [[wikilink]] in the body.`,
+            "",
+            `Sample entry slugs: ${topSlugs.join(", ")}`,
+          ].join("\n"),
+        },
+      ],
+      {
+        onToken: (token) => { aggregateGeneration += token },
+        onDone: () => {},
+        onError: (err) => {
+          console.warn(`[ingest:strategy] tabular aggregate generation failed: ${err.message}`)
+        },
+      },
+      signal,
+      {
+        temperature: 0.1,
+        reasoning: { mode: "off" },
+        max_tokens: computeIngestGenerationMaxTokens(llmConfig.maxContextSize),
+      },
+    )
+
+    if (aggregateGeneration.trim()) {
+      const aggResult = await writeFileBlocks(
+        pp,
+        aggregateGeneration,
+        llmConfig,
+        sourceIdentity,
+        sourceSummaryPath,
+        signal,
+      )
+      allWrittenPaths.push(...aggResult.writtenPaths)
+      allWriteWarnings.push(...aggResult.warnings)
+      allHardFailures.push(...aggResult.hardFailures)
+      allReviewItems += aggregateGeneration
+    }
+
+    // Surface pure alias/"vedi" rows as review items so cross-references
+    // aren't silently dropped (they don't generate their own page).
+    if (tabularAliasRows.length > 0) {
+      allReviewItems += "\n" + tabularAliasRows.map(buildAliasReviewBlock).join("\n")
+      console.log(
+        `[ingest:strategy] tabular: ${tabularAliasRows.length} alias row(s) surfaced as review items`,
+      )
+    }
+
+    generation = allReviewItems
+  }
+
+  if (!usedBatchGeneration) {
+    // Standard mode: single LLM call (includes small encyclopedia / mixed narrative sections)
     await streamChat(
       llmConfig,
       [
@@ -1506,7 +1874,10 @@ async function autoIngestImpl(
         onToken: (token) => { generation += token },
         onDone: () => {},
         onError: (err) => {
-          activity.updateItem(activityId, { status: "error", detail: `Generation failed: ${err.message}` })
+          activity.updateItem(activityId, {
+            status: "error",
+            detail: ingestErrorDetail("generation", err.message),
+          })
         },
       },
       signal,
@@ -1578,7 +1949,7 @@ async function autoIngestImpl(
   let writeWarnings: string[]
   let hardFailures: string[]
 
-  if (encyclopediaBatches.length > 0) {
+  if (usedBatchGeneration) {
     // Batch mode: files already written, just use accumulated results
     writtenPaths = allWrittenPaths
     writeWarnings = allWriteWarnings
@@ -1586,7 +1957,7 @@ async function autoIngestImpl(
   } else {
     // Standard mode: write all generation output at once
     throwIfIngestAborted(signal, activityId)
-    activity.updateItem(activityId, { detail: "Writing files..." })
+    ingestWritingFiles(activityId)
     await migrateLegacySourceSummaryIfSafe(pp, sourceIdentity, sourceSummaryPath)
     const writeResult = await writeFileBlocks(
       pp,
@@ -1606,21 +1977,55 @@ async function autoIngestImpl(
 
   // ── Post-generation drift check (encyclopedia mode) ────────────
   if (ingestStrategy === "encyclopedia" && headingTree.length > 0) {
-    const expectedEntries = countEncyclopediaEntries(headingTree, 1)
-    const conceptPaths = writtenPaths.filter((p) =>
-      p.startsWith("wiki/concepts/") || p.startsWith("wiki/entities/"),
+    const classification = classifyHeadings(headingTree, 1)
+    const documentName = fileName.replace(/\.[^.]+$/, "")
+    const expectedSlugs = new Set(
+      [...computeEntrySlugs(classification.entries, fileSlugMode, documentName, fileSlugNamespace).values()],
     )
-    const driftRatio = expectedEntries > 0
-      ? conceptPaths.length / expectedEntries
-      : 1
+    const writtenSlugs = new Set(
+      writtenPaths
+        .filter((p) => p.startsWith("wiki/concepts/") || p.startsWith("wiki/entities/"))
+        .map((p) => p.replace(/^wiki\/(concepts|entities)\//, "").replace(/\.md$/, "")),
+    )
+    const missingSlugs = [...expectedSlugs].filter((s) => !writtenSlugs.has(s))
+    const expectedEntries = expectedSlugs.size
+    const driftRatio = expectedEntries > 0 ? writtenSlugs.size / expectedEntries : 1
+
     if (driftRatio < 0.9) {
-      const msg = `Encyclopedia mode drift: generated ${conceptPaths.length} concept/entity pages but ${expectedEntries} headings were available (${Math.round(driftRatio * 100)}% coverage). Some entries may be missing.`
+      warnDrift(activityId, Math.round(driftRatio * 100), missingSlugs)
+      const msg = `Encyclopedia mode drift: generated ${writtenSlugs.size}/${expectedEntries} expected entries (${Math.round(driftRatio * 100)}% coverage). Missing: ${missingSlugs.slice(0, 8).join(", ")}${missingSlugs.length > 8 ? ", ..." : ""}`
       console.warn(`[ingest:strategy] ${msg}`)
       writeWarnings.push(msg)
     } else {
       console.log(
-        `[ingest:strategy] encyclopedia drift check OK: ${conceptPaths.length}/${expectedEntries} entries (${Math.round(driftRatio * 100)}%)`,
+        `[ingest:strategy] encyclopedia drift check OK: ${writtenSlugs.size}/${expectedEntries} entries (${Math.round(driftRatio * 100)}%)`,
       )
+    }
+  }
+
+  // ── Post-generation validation (narrative + all strategies) ─────
+  if (ingestStrategy === "narrative") {
+    const chapterPages = findUndesiredChapterPages(writtenPaths)
+    if (chapterPages.length > 0) {
+      warnChapterPages(activityId, chapterPages)
+      const msg = `Narrative mode: undesired chapter pages created: ${chapterPages.join(", ")}`
+      console.warn(`[ingest:strategy] ${msg}`)
+      writeWarnings.push(msg)
+    }
+  }
+
+  if (sourceSummaryPath) {
+    try {
+      const summaryContent = await readFile(`${pp}/${sourceSummaryPath}`)
+      const hubCheck = validateSourceSummaryHub(summaryContent)
+      if (!hubCheck.ok) {
+        warnSourceHub(activityId, hubCheck.count, SOURCE_SUMMARY_MIN_WIKILINKS)
+        const msg = `Source summary has only ${hubCheck.count} body wikilink(s) — expected at least ${SOURCE_SUMMARY_MIN_WIKILINKS} for graph hub connectivity`
+        console.warn(`[ingest:strategy] ${msg}`)
+        writeWarnings.push(msg)
+      }
+    } catch {
+      // Summary not written yet
     }
   }
 
@@ -1637,9 +2042,7 @@ async function autoIngestImpl(
     )
   }
   if (repairableAggregatePaths.length > 0 && !signal?.aborted) {
-    activity.updateItem(activityId, {
-      detail: `Repairing aggregate wiki files: ${repairableAggregatePaths.join(", ")}`,
-    })
+    ingestRepairAggregates(activityId, repairableAggregatePaths)
     let aggregateRepairOutput = ""
     try {
       await streamChat(
@@ -1714,10 +2117,7 @@ async function autoIngestImpl(
   let warningSummary = ""
   if (writeWarnings.length > 0) {
     await appendIngestWarningLog(pp, sourceIdentity, writeWarnings)
-    warningSummary = writeWarnings.length === 1
-      ? writeWarnings[0]
-      : `${writeWarnings.length} ingest warnings: ${writeWarnings.slice(0, 2).join(" · ")}${writeWarnings.length > 2 ? ` … (+${writeWarnings.length - 2} more in .llm-wiki/ingest-warnings.log)` : ""}`
-    activity.updateItem(activityId, { detail: `${warningSummary} — saved to .llm-wiki/ingest-warnings.log` })
+    warningSummary = ingestWriteWarnings(activityId, writeWarnings)
   }
 
   // Ensure source summary page exists (LLM may not have generated it correctly)
@@ -1794,7 +2194,15 @@ async function autoIngestImpl(
   // — they represent deterministic decisions and caching them is
   // safe.
   if (writtenPaths.length > 0 && hardFailures.length === 0) {
-    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths, ingestStrategy)
+    await saveIngestCache(
+      pp,
+      sourceIdentity,
+      sourceContent,
+      writtenPaths,
+      ingestStrategy,
+      fileSlugMode,
+      fileSlugNamespace,
+    )
     if (longSourceCheckpointPath) {
       await clearLongSourceCheckpoint(longSourceCheckpointPath)
     }
@@ -1829,18 +2237,19 @@ async function autoIngestImpl(
     }
   }
 
-  const baseDetail = writtenPaths.length > 0
-    ? `${writtenPaths.length} files written${reviewItems.length > 0 ? `, ${reviewItems.length} review item(s)` : ""}`
-    : "No files generated"
-  const detail = warningSummary
-    ? `${baseDetail} — ${warningSummary} (saved to .llm-wiki/ingest-warnings.log)`
-    : baseDetail
+  const detail = formatIngestDoneDetail(
+    writtenPaths.length,
+    reviewItems.length,
+    warningSummary,
+    activityId,
+  )
 
   activity.updateItem(activityId, {
     status: writtenPaths.length > 0 ? "done" : "error",
     detail,
     filesWritten: writtenPaths,
   })
+  clearIngestProgress(activityId)
 
   return writtenPaths
 }
@@ -2456,6 +2865,16 @@ function buildAnalysisStrategyHint(strategy: IngestStrategy): string {
         "- Track plot progression and timeline, but do NOT treat chapters as entities",
         "- Link extracted entities to existing wiki pages where possible",
       ].join("\n")
+    case "tabular":
+      return [
+        "## Document Type: Tabular Glossary",
+        "This document is a glossary or index where each table row is one entry.",
+        "When analyzing:",
+        "- Treat each row as a potential wiki entity or concept",
+        "- Note tipo/type columns for entity vs concept classification",
+        "- Consolidate multi-book column descriptions per entry",
+        "- Flag alias/vedi rows as redirects, not duplicate pages",
+      ].join("\n")
     default:
       return ""
   }
@@ -2609,6 +3028,23 @@ function buildGenerationStrategySection(
       "5. Use the chapter title as temporal context in the analysis, not as a title.",
       "6. Link extracted entities to existing wiki pages where possible.",
       "7. Note first appearances and relationships in entity pages.",
+      "8. The source summary MUST include [[wikilink]] to major characters/places in the body.",
+    ].join("\n")
+  }
+
+  if (strategy === "tabular") {
+    return [
+      "## Ingest Strategy: Tabular Mode",
+      "",
+      "This document is a glossary/index. Each table row is one wiki entry.",
+      "",
+      "CRITICAL RULES:",
+      "1. Create one FILE block per row using the pre-computed slug.",
+      "2. Use tipo/type to choose entity vs concept directory.",
+      "3. Merge libro 1/2/3 descriptions into a single page per entry.",
+      "4. Rows with alias/vedi → REVIEW block, not a duplicate page.",
+      "5. Source summary must link major entries with [[wikilink]] in the body.",
+      "6. Include `ingest_strategy: tabular` in frontmatter.",
     ].join("\n")
   }
 
@@ -3122,6 +3558,25 @@ function overlapSuffix(text: string, maxChars: number): string {
   return raw.trim()
 }
 
+/** Use narrative heading boundaries as chunk boundaries when chapters fit budget. */
+export function splitSourceAtNarrativeBoundaries(
+  headingTree: HeadingNode[],
+  targetChars: number,
+): SourceChunk[] | null {
+  if (headingTree.length === 0) return null
+  const maxChapterChars = targetChars * 2
+  if (headingTree.some((n) => n.content.length > maxChapterChars)) return null
+
+  return headingTree.map((node, idx) => ({
+    id: `chapter-${idx + 1}`,
+    index: idx + 1,
+    total: headingTree.length,
+    headingPath: node.headingPath.join(" > "),
+    overlapBefore: idx > 0 ? overlapSuffix(headingTree[idx - 1].content, 800) : "",
+    main: `# ${node.title}\n\n${node.content}`.trim(),
+  }))
+}
+
 export function splitSourceIntoSemanticChunks(
   content: string,
   targetChars: number,
@@ -3372,10 +3827,15 @@ async function analyzeLongSourceInChunks(
   activityId: string,
   signal?: AbortSignal,
   ingestStrategy: string = "fixed",
+  headingTree: HeadingNode[] = [],
 ): Promise<LongSourcePlan> {
   const targetChars = clampNumber(Math.floor(sourceBudget * 0.55), LONG_SOURCE_CHUNK_MIN, LONG_SOURCE_CHUNK_MAX)
   const overlapChars = clampNumber(Math.floor(targetChars * 0.08), 800, 3_000)
-  const chunks = splitSourceIntoSemanticChunks(sourceContent, targetChars, overlapChars)
+  const narrativeChunks =
+    ingestStrategy === "narrative"
+      ? splitSourceAtNarrativeBoundaries(headingTree, targetChars)
+      : null
+  const chunks = narrativeChunks ?? splitSourceIntoSemanticChunks(sourceContent, targetChars, overlapChars)
   if (chunks.length <= 1) {
     return { chunked: false, analysis: "", sourceContext: sourceContent }
   }
@@ -3401,17 +3861,13 @@ async function analyzeLongSourceInChunks(
   let completedThrough = checkpoint?.completedThrough ?? 0
 
   if (completedThrough > 0) {
-    activity.updateItem(activityId, {
-      detail: `Resuming long source analysis from chunk ${completedThrough + 1}/${chunks.length}...`,
-    })
+    ingestLongSourceResume(activityId, completedThrough + 1, chunks.length)
   }
 
   for (const chunk of chunks) {
     if (chunk.index <= completedThrough) continue
     throwIfIngestAborted(signal, activityId)
-    activity.updateItem(activityId, {
-      detail: `Analyzing long source chunk ${chunk.index}/${chunk.total}...`,
-    })
+    ingestLongSourceChunk(activityId, chunk.index, chunk.total)
 
     let raw = ""
     let hadError = false
@@ -3434,7 +3890,10 @@ async function analyzeLongSourceInChunks(
         onDone: () => {},
         onError: (err) => {
           hadError = true
-          activity.updateItem(activityId, { status: "error", detail: `Chunk analysis failed: ${err.message}` })
+          activity.updateItem(activityId, {
+            status: "error",
+            detail: ingestErrorDetail("chunk", err.message),
+          })
         },
       },
       signal,

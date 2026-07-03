@@ -16,6 +16,7 @@
 import type { ClassificationResult, IngestStrategy } from "@/types/ingest"
 import { CLASSIFIER_CONFIDENCE_THRESHOLD } from "@/types/ingest"
 import { stripFrontmatter } from "./text-chunker"
+import { classifyTableDocument, stripMarkdownTableLines } from "./table-structure-parser"
 
 /** Rough chars-per-token ratio used by the rest of the codebase. */
 const CHARS_PER_TOKEN = 4
@@ -120,7 +121,8 @@ export function computeDocumentStats(content: string): DocumentStats {
   ).length
   const chapterHeadingRatio = headingCount > 0 ? chapterHeadingCount / headingCount : 0
 
-  const dialogueCount = (body.match(DIALOGUE_RE) || []).length
+  const dialogueBody = stripMarkdownTableLines(body)
+  const dialogueCount = (dialogueBody.match(DIALOGUE_RE) || []).length
 
   return {
     lineCount,
@@ -163,6 +165,22 @@ export function heuristicClassify(content: string): ClassificationResult {
 
   const enc: Score = { strategy: "encyclopedia", points: 0, reasoning: [] }
   const nar: Score = { strategy: "narrative", points: 0, reasoning: [] }
+  const tab: Score = { strategy: "tabular", points: 0, reasoning: [] }
+
+  const tableInfo = classifyTableDocument(content)
+  const tabularDominant = tableInfo.isTabular
+
+  if (tabularDominant) {
+    tab.points += 6
+    tab.reasoning.push(
+      `dominant table (${tableInfo.tableRowCount} rows, ${(tableInfo.tableLineRatio * 100).toFixed(0)}% of lines)`,
+    )
+    if (tableInfo.semanticHeaderHits >= 3) {
+      tab.points += 2
+      tab.reasoning.push(`semantic glossary headers (${tableInfo.semanticHeaderHits})`)
+    }
+    tab.reasoning.push(...tableInfo.reasoning)
+  }
 
   // When chapter-like headings dominate, ALL encyclopedia signals are
   // suppressed — chapter titles are naturally short, section length
@@ -170,6 +188,7 @@ export function heuristicClassify(content: string): ClassificationResult {
   // short chapters. Only narrative signals should contribute.
   const chapterDominant = stats.chapterHeadingRatio > 0.5
 
+  if (!tabularDominant) {
   // ── Encyclopedia signals (suppressed when chapterDominant) ──────
   if (!chapterDominant && stats.headingDensity > 2) {
     enc.points += 2
@@ -256,35 +275,35 @@ export function heuristicClassify(content: string): ClassificationResult {
     nar.points += 1
     nar.reasoning.push(`dialogue markers present (${stats.dialogueCount})`)
   }
+  } // !tabularDominant
 
   // ── Decide winner ───────────────────────────────────────────────
-  const total = enc.points + nar.points
+  const total = enc.points + nar.points + tab.points
   let strategy: IngestStrategy
   let confidence: number
   let winnerReasoning: string[]
 
   if (total === 0) {
-    // No structural signal at all — likely unstructured prose or code.
     strategy = "fixed"
     confidence = 0.5
     winnerReasoning = ["no strong structural signal — defaulting to fixed chunks"]
-  } else if (enc.points > nar.points) {
-    strategy = "encyclopedia"
-    confidence = enc.points / total
-    winnerReasoning = enc.reasoning
-  } else if (nar.points > enc.points) {
-    strategy = "narrative"
-    confidence = nar.points / total
-    winnerReasoning = nar.reasoning
   } else {
-    // Tie — ambiguous document.
-    strategy = "fixed"
-    confidence = 0.4
-    winnerReasoning = [
-      ...enc.reasoning,
-      ...nar.reasoning,
-      "tie between encyclopedia and narrative signals — defaulting to fixed chunks",
-    ]
+    const scores = [enc, nar, tab].sort((a, b) => b.points - a.points)
+    const winner = scores[0]
+    const runnerUp = scores[1]?.points ?? 0
+    strategy = winner.strategy
+    confidence = winner.points / total
+    winnerReasoning = winner.reasoning
+    if (winner.points === runnerUp && runnerUp > 0) {
+      strategy = "fixed"
+      confidence = 0.4
+      winnerReasoning = [
+        ...enc.reasoning,
+        ...nar.reasoning,
+        ...tab.reasoning,
+        "tie between ingest signals — defaulting to fixed chunks",
+      ]
+    }
   }
 
   reasoning.push(

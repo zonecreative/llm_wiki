@@ -489,7 +489,16 @@ function ActivityRow({ item, onCancel }: { item: ActivityItem; onCancel?: () => 
         </div>
         <div className="min-w-0 flex-1">
           <div className="font-medium">{item.title}</div>
-          <div className="text-muted-foreground mt-0.5">{item.detail}</div>
+          <div className="text-muted-foreground mt-0.5 whitespace-pre-line">
+            {item.detail.split("\n").map((line, idx) => (
+              <div
+                key={idx}
+                className={line.startsWith("⚠") ? "text-amber-600 dark:text-amber-500" : undefined}
+              >
+                {line}
+              </div>
+            ))}
+          </div>
         </div>
         {item.status === "running" && onCancel && (
           <button

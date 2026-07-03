@@ -51,3 +51,6 @@ pnpm-debug.log*
 # Local outputs
 graphify-out/
 .claude/
+
+wiki-soeliok/
+wiki-zonecreative/

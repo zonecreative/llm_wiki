@@ -54,10 +54,11 @@ export interface HeadingNode {
  * - `encyclopedia` — structured reference; one wiki node per heading.
  * - `narrative` — story/prose; headings are chapter boundaries, not entities.
  * - `fixed` — legacy token-window chunking (unchanged behavior).
+ * - `tabular` — glossary/index where each table row is a wiki entry.
  * - `mixed` — document has both encyclopedic and narrative sections
  *   (handled per-H1; reserved for future work — see PLAN step 5).
  */
-export type IngestStrategy = "encyclopedia" | "narrative" | "fixed" | "mixed"
+export type IngestStrategy = "encyclopedia" | "narrative" | "fixed" | "mixed" | "tabular"
 
 /**
  * Result of the document classifier (Level 1 heuristic, future Level 2

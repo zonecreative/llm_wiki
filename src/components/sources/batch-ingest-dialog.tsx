@@ -21,7 +21,7 @@ import { listDirectory } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { forceReingestSource } from "@/lib/source-lifecycle"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
-import { heuristicClassify } from "@/lib/document-classifier"
+import { resolveIngestStrategy } from "@/lib/ingest-strategy-resolver"
 import type { IngestStrategy, SlugMode } from "@/types/ingest"
 import type { FileIngestOverride } from "@/types/ingest"
 import { collectAllFilesIncludingDot } from "@/lib/sources-tree-delete"
@@ -33,6 +33,7 @@ interface BatchFileEntry {
   strategy: IngestStrategy | "auto"
   slugMode: SlugMode
   slugNamespace: string
+  clean: boolean
   suggested?: IngestStrategy
   confidence?: number
 }
@@ -47,6 +48,7 @@ const STRATEGY_LABELS: Record<IngestStrategy | "auto", string> = {
   encyclopedia: "Encyclopedia",
   narrative: "Narrative",
   fixed: "Fixed",
+  tabular: "Tabular",
   mixed: "Mixed",
 }
 
@@ -54,9 +56,19 @@ const STRATEGY_DESCRIPTIONS: Record<IngestStrategy | "auto", string> = {
   auto: "Auto-classify each file using the heuristic classifier. Asks for confirmation when confidence is low.",
   encyclopedia: "Each heading becomes a wiki page. Best for compendiums, manuals, glossaries, bestiaries, spell lists. Structural headings (repeated across entries) are folded into their parent.",
   narrative: "Headings are chapter boundaries, not entities. Extracts characters, places, events from prose. Best for novels, stories, screenplays. Does NOT create pages for chapters.",
+  tabular: "Each table row becomes a wiki page. Best for glossaries, indices of names, bilingual reference tables, CSV/TSV exports.",
   fixed: "Legacy token-window chunking. The LLM decides freely what to extract. Best for essays, articles, academic papers, blog posts, and any document where headings are argumentative (sections of a discourse), not definitional (entries of a reference).",
-  mixed: "Document has both encyclopedic and narrative sections. Each H1 section is classified separately. (Future work — not yet implemented.)",
+  mixed: "Document has both encyclopedic and narrative sections. Each H1 section is classified separately.",
 }
+
+const BATCH_STRATEGIES: Array<IngestStrategy | "auto"> = [
+  "auto",
+  "encyclopedia",
+  "narrative",
+  "tabular",
+  "fixed",
+  "mixed",
+]
 
 export function BatchIngestDialog({ open, onClose }: Props) {
   const { t } = useTranslation()
@@ -123,15 +135,29 @@ export function BatchIngestDialog({ open, onClose }: Props) {
           try {
             const { readFile } = await import("@/commands/fs")
             const content = await readFile(file.path, { extractImages: false })
-            const result = heuristicClassify(content)
+            const result = resolveIngestStrategy({
+              content,
+              config: ingestStrategyConfig,
+              fileName,
+              interactive: false,
+            })
             suggested = result.strategy
-            confidence = result.confidence
+            confidence = result.classification?.confidence
           } catch {
             // Can't read file — leave suggestion undefined
           }
         }
 
-        entries.push({ path: file.path, name: fileName, strategy, slugMode, slugNamespace, suggested, confidence })
+        entries.push({
+          path: file.path,
+          name: fileName,
+          strategy,
+          slugMode,
+          slugNamespace,
+          clean: false,
+          suggested,
+          confidence,
+        })
       }
 
       setFiles(entries)
@@ -167,6 +193,12 @@ export function BatchIngestDialog({ open, onClose }: Props) {
     )
   }
 
+  const updateClean = (fileName: string, clean: boolean) => {
+    setFiles((prev) =>
+      prev.map((f) => (f.name === fileName ? { ...f, clean } : f)),
+    )
+  }
+
   // Bulk-apply a strategy to all files
   const applyToAll = (strategy: IngestStrategy | "auto") => {
     setFiles((prev) => prev.map((f) => ({ ...f, strategy })))
@@ -175,6 +207,10 @@ export function BatchIngestDialog({ open, onClose }: Props) {
   // Bulk-apply slug mode to all files
   const applySlugModeToAll = (slugMode: SlugMode) => {
     setFiles((prev) => prev.map((f) => ({ ...f, slugMode })))
+  }
+
+  const applyCleanToAll = (clean: boolean) => {
+    setFiles((prev) => prev.map((f) => ({ ...f, clean })))
   }
 
   // Accept all suggestions
@@ -221,8 +257,9 @@ export function BatchIngestDialog({ open, onClose }: Props) {
 
     setIngesting(true)
     try {
-      const filePaths = files.map((f) => f.path)
-      await forceReingestSource(project, filePaths, llmConfig)
+      for (const file of files) {
+        await forceReingestSource(project, [file.path], llmConfig, { clean: file.clean })
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -244,7 +281,7 @@ export function BatchIngestDialog({ open, onClose }: Props) {
       onClick={onClose}
     >
       <div
-        className="flex max-h-[85vh] w-[600px] flex-col rounded-lg border border-border bg-background shadow-lg"
+        className="flex max-h-[85vh] w-[760px] flex-col rounded-lg border border-border bg-background shadow-lg"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -263,34 +300,16 @@ export function BatchIngestDialog({ open, onClose }: Props) {
         {/* Bulk actions */}
         <div className="flex flex-wrap items-center gap-2 border-b px-5 py-2 text-xs">
           <span className="text-muted-foreground">Apply to all:</span>
-          <button
-            className="rounded border px-2 py-0.5 hover:bg-accent"
-            title={STRATEGY_DESCRIPTIONS.auto}
-            onClick={() => applyToAll("auto")}
-          >
-            Auto
-          </button>
-          <button
-            className="rounded border px-2 py-0.5 hover:bg-accent"
-            title={STRATEGY_DESCRIPTIONS.encyclopedia}
-            onClick={() => applyToAll("encyclopedia")}
-          >
-            Encyclopedia
-          </button>
-          <button
-            className="rounded border px-2 py-0.5 hover:bg-accent"
-            title={STRATEGY_DESCRIPTIONS.narrative}
-            onClick={() => applyToAll("narrative")}
-          >
-            Narrative
-          </button>
-          <button
-            className="rounded border px-2 py-0.5 hover:bg-accent"
-            title={STRATEGY_DESCRIPTIONS.fixed}
-            onClick={() => applyToAll("fixed")}
-          >
-            Fixed
-          </button>
+          {BATCH_STRATEGIES.map((strategy) => (
+            <button
+              key={strategy}
+              className="rounded border px-2 py-0.5 hover:bg-accent"
+              title={STRATEGY_DESCRIPTIONS[strategy]}
+              onClick={() => applyToAll(strategy)}
+            >
+              {STRATEGY_LABELS[strategy]}
+            </button>
+          ))}
           {hasSuggestions && (
             <button
               className="ml-auto rounded border border-primary/50 px-2 py-0.5 text-primary hover:bg-primary/5"
@@ -303,9 +322,30 @@ export function BatchIngestDialog({ open, onClose }: Props) {
 
         {/* Strategy guide */}
         <div className="border-b bg-muted/30 px-5 py-2 text-[11px] text-muted-foreground">
-          <div><strong>Encyclopedia:</strong> compendi, manuali, glossari, bestiari, elenchi magie/armi — una pagina per voce</div>
-          <div><strong>Narrative:</strong> romanzi, racconti, sceneggiature — estrae personaggi/luoghi/eventi, niente pagine capitolo</div>
-          <div><strong>Fixed:</strong> saggi, articoli, paper, blog — il LLM decide liberamente cosa estrarre</div>
+          <div><strong>Encyclopedia:</strong> compendi, manuali, bestiari — una pagina per voce/heading</div>
+          <div><strong>Narrative:</strong> romanzi, racconti — estrae personaggi/luoghi/eventi, niente pagine capitolo</div>
+          <div><strong>Tabular:</strong> indici dei nomi, glossari tabellari — una pagina per riga</div>
+          <div><strong>Mixed:</strong> documenti ibridi — classifica ogni sezione H1 separatamente</div>
+          <div><strong>Fixed:</strong> saggi, articoli, paper — il LLM decide liberamente cosa estrarre</div>
+        </div>
+
+        {/* Clean re-ingest bulk actions */}
+        <div className="flex flex-wrap items-center gap-2 border-b px-5 py-2 text-xs">
+          <span className="text-muted-foreground">{t("sources.batchCleanLabel")}</span>
+          <button
+            className="rounded border px-2 py-0.5 hover:bg-accent"
+            title={t("sources.batchCleanAllHint")}
+            onClick={() => applyCleanToAll(true)}
+          >
+            {t("sources.batchCleanAll")}
+          </button>
+          <button
+            className="rounded border px-2 py-0.5 hover:bg-accent"
+            title={t("sources.batchMergeAllHint")}
+            onClick={() => applyCleanToAll(false)}
+          >
+            {t("sources.batchMergeAll")}
+          </button>
         </div>
 
         {/* Slug mode bulk actions */}
@@ -356,10 +396,11 @@ export function BatchIngestDialog({ open, onClose }: Props) {
                   title={STRATEGY_DESCRIPTIONS[file.strategy]}
                   className="w-32 rounded-md border border-input bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
                 >
-                  <option value="auto">Auto</option>
-                  <option value="encyclopedia">Encyclopedia</option>
-                  <option value="narrative">Narrative</option>
-                  <option value="fixed">Fixed</option>
+                  {BATCH_STRATEGIES.map((strategy) => (
+                    <option key={strategy} value={strategy}>
+                      {STRATEGY_LABELS[strategy]}
+                    </option>
+                  ))}
                 </select>
                 {file.strategy === "encyclopedia" && (
                   <>
@@ -387,6 +428,17 @@ export function BatchIngestDialog({ open, onClose }: Props) {
                     )}
                   </>
                 )}
+                <label
+                  className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground"
+                  title={t("sources.batchCleanFileHint")}
+                >
+                  <input
+                    type="checkbox"
+                    checked={file.clean}
+                    onChange={(e) => updateClean(file.name, e.target.checked)}
+                  />
+                  {t("sources.batchCleanFile")}
+                </label>
               </div>
             ))}
           </div>
@@ -395,7 +447,7 @@ export function BatchIngestDialog({ open, onClose }: Props) {
         {/* Footer */}
         <div className="flex items-center justify-between border-t px-5 py-3">
           <span className="text-xs text-muted-foreground">
-            {files.length} file(s) · {files.filter((f) => f.strategy !== "auto").length} with override
+            {files.length} file(s) · {files.filter((f) => f.strategy !== "auto").length} override · {files.filter((f) => f.clean).length} clean
           </span>
           <div className="flex gap-2">
             <Button variant="outline" onClick={onClose} disabled={ingesting}>

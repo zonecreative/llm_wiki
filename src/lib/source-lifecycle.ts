@@ -17,6 +17,7 @@ import { getFileName, getFileStem, getRelativePath, normalizePath } from "@/lib/
 import {
   sourceIdentityForPath,
   sourceReferenceIdentity,
+  sourceSummarySlugFromIdentity,
 } from "@/lib/source-identity"
 import {
   parseFrontmatterArray,
@@ -274,25 +275,11 @@ export async function deleteSourceFiles(
   options: { fileAlreadyDeleted?: boolean; logReason?: string } = {},
 ): Promise<DeleteSourcesResult> {
   const pp = normalizePath(projectPath)
-  const sourceInfos = sourcePaths
-    .map((sourcePath) => {
-      const source = normalizePath(sourcePath)
-      return {
-        source,
-        fileName: getFileName(source),
-        identity: sourceIdentityForPath(pp, source),
-      }
-    })
-    .filter((info) => info.fileName.length > 0)
+  const sourceInfos = buildSourceDeleteInfos(pp, sourcePaths)
 
   if (sourceInfos.length === 0) {
     return { deletedWikiPaths: [], rewrittenSourcePages: 0, skippedPages: 0 }
   }
-
-  const deletingNames = new Set(sourceInfos.map((info) => info.fileName.toLowerCase()))
-  const deletingIdentities = new Set(
-    sourceInfos.map((info) => sourceReferenceIdentity(info.identity).toLowerCase()),
-  )
 
   if (!options.fileAlreadyDeleted) {
     for (const info of sourceInfos) {
@@ -315,57 +302,8 @@ export async function deleteSourceFiles(
     }
   }
 
-  const pagesToDelete: string[] = []
-  let rewrittenSourcePages = 0
-  let skippedPages = 0
-
-  let allMd: FileNode[] = []
-  try {
-    allMd = flattenMd(await listDirectory(`${pp}/wiki`))
-  } catch (err) {
-    console.warn("[source-lifecycle] failed to scan wiki sources during delete:", err)
-  }
-
-  for (const file of allMd) {
-    let content: string
-    try {
-      content = await readFile(file.path)
-    } catch (err) {
-      console.warn(`[source-lifecycle] failed to read ${file.path}:`, err)
-      continue
-    }
-
-    const sources = parseSources(content)
-    if (sources.length === 0) {
-      skippedPages++
-      continue
-    }
-
-    const survivors = sources.filter(
-      (source) => !sourceNameMatchesAny(source, deletingIdentities, deletingNames),
-    )
-    if (survivors.length === sources.length) {
-      continue
-    }
-
-    if (survivors.length === 0) {
-      pagesToDelete.push(file.path)
-    } else {
-      try {
-        await writeFile(file.path, writeSources(content, survivors))
-        rewrittenSourcePages++
-      } catch (err) {
-        console.warn(`[source-lifecycle] failed to rewrite sources for ${file.path}:`, err)
-      }
-    }
-  }
-
-  let deletedWikiPaths: string[] = []
-  if (pagesToDelete.length > 0) {
-    const { cascadeDeleteWikiPagesWithRefs } = await import("@/lib/wiki-page-delete")
-    const result = await cascadeDeleteWikiPagesWithRefs(pp, pagesToDelete)
-    deletedWikiPaths = result.deletedPaths
-  }
+  const purgeResult = await purgeWikiPagesLinkedToSources(pp, sourceInfos)
+  const { deletedWikiPaths, rewrittenSourcePages, skippedPages } = purgeResult
 
   await appendSourceDeleteLog(pp, sourceInfos.map((info) => info.identity), {
     reason: options.logReason ?? (options.fileAlreadyDeleted ? "external delete" : "delete"),
@@ -542,10 +480,158 @@ function sourceNameMatchesAny(
   return deletingNames.has(normalizedSource)
 }
 
+export interface PurgeWikiPagesForSourcesResult {
+  deletedWikiPaths: string[]
+  rewrittenSourcePages: number
+  skippedPages: number
+}
+
+interface SourceDeleteInfo {
+  source: string
+  fileName: string
+  identity: string
+}
+
+function buildSourceDeleteInfos(
+  projectPath: string,
+  sourcePaths: string[],
+): SourceDeleteInfo[] {
+  const pp = normalizePath(projectPath)
+  return sourcePaths
+    .map((sourcePath) => {
+      const source = normalizePath(sourcePath)
+      return {
+        source,
+        fileName: getFileName(source),
+        identity: sourceIdentityForPath(pp, source),
+      }
+    })
+    .filter((info) => info.fileName.length > 0)
+}
+
+async function purgeWikiPagesLinkedToSources(
+  projectPath: string,
+  sourceInfos: SourceDeleteInfo[],
+): Promise<PurgeWikiPagesForSourcesResult> {
+  const pp = normalizePath(projectPath)
+  const deletingNames = new Set(sourceInfos.map((info) => info.fileName.toLowerCase()))
+  const deletingIdentities = new Set(
+    sourceInfos.map((info) => sourceReferenceIdentity(info.identity).toLowerCase()),
+  )
+
+  const pagesToDelete: string[] = []
+  let rewrittenSourcePages = 0
+  let skippedPages = 0
+
+  let allMd: FileNode[] = []
+  try {
+    allMd = flattenMd(await listDirectory(`${pp}/wiki`))
+  } catch (err) {
+    console.warn("[source-lifecycle] failed to scan wiki during purge:", err)
+  }
+
+  for (const file of allMd) {
+    let content: string
+    try {
+      content = await readFile(file.path)
+    } catch (err) {
+      console.warn(`[source-lifecycle] failed to read ${file.path}:`, err)
+      continue
+    }
+
+    const sources = parseSources(content)
+    if (sources.length === 0) {
+      skippedPages++
+      continue
+    }
+
+    const survivors = sources.filter(
+      (source) => !sourceNameMatchesAny(source, deletingIdentities, deletingNames),
+    )
+    if (survivors.length === sources.length) {
+      continue
+    }
+
+    if (survivors.length === 0) {
+      pagesToDelete.push(file.path)
+    } else {
+      try {
+        await writeFile(file.path, writeSources(content, survivors))
+        rewrittenSourcePages++
+      } catch (err) {
+        console.warn(`[source-lifecycle] failed to rewrite sources for ${file.path}:`, err)
+      }
+    }
+  }
+
+  let deletedWikiPaths: string[] = []
+  if (pagesToDelete.length > 0) {
+    const { cascadeDeleteWikiPagesWithRefs } = await import("@/lib/wiki-page-delete")
+    const result = await cascadeDeleteWikiPagesWithRefs(pp, pagesToDelete)
+    deletedWikiPaths = result.deletedPaths
+  }
+
+  return { deletedWikiPaths, rewrittenSourcePages, skippedPages }
+}
+
+/**
+ * Remove wiki pages that belong only to the given source file(s).
+ * Shared pages keep their body but lose the source reference in frontmatter.
+ * Does not delete the raw source files.
+ */
+export async function purgeWikiPagesForSources(
+  projectPath: string,
+  sourcePaths: string[],
+): Promise<PurgeWikiPagesForSourcesResult> {
+  const sourceInfos = buildSourceDeleteInfos(projectPath, sourcePaths)
+  if (sourceInfos.length === 0) {
+    return { deletedWikiPaths: [], rewrittenSourcePages: 0, skippedPages: 0 }
+  }
+  return purgeWikiPagesLinkedToSources(projectPath, sourceInfos)
+}
+
+async function clearIngestProgressCheckpointsForSources(
+  projectPath: string,
+  sourcePaths: string[],
+): Promise<void> {
+  const pp = normalizePath(projectPath)
+  const slugs = new Set<string>()
+  for (const sourcePath of sourcePaths) {
+    if (!isIngestableSourcePath(sourcePath)) continue
+    const identity = sourceIdentityForPath(pp, normalizePath(sourcePath))
+    slugs.add(sourceSummarySlugFromIdentity(identity))
+  }
+  if (slugs.size === 0) return
+
+  const progressDir = `${pp}/.llm-wiki/ingest-progress`
+  try {
+    const entries = await listDirectory(progressDir)
+    for (const entry of entries) {
+      if (entry.is_dir) continue
+      if ([...slugs].some((slug) => entry.name.includes(slug))) {
+        try {
+          await deleteFile(entry.path)
+        } catch {
+          // non-critical
+        }
+      }
+    }
+  } catch {
+    // progress dir may not exist
+  }
+}
+
 function withRootContext(context: string, rootContext?: string): string {
   if (!rootContext) return context
   if (!context) return rootContext
   return `${rootContext} > ${context}`
+}
+
+export interface ForceReingestOptions {
+  sourceRoot?: string
+  rootContext?: string
+  /** Delete wiki pages linked to the source(s) before re-ingesting. */
+  clean?: boolean
 }
 
 /**
@@ -563,10 +649,26 @@ export async function forceReingestSource(
   project: WikiProject,
   sourcePaths: string[],
   llmConfig: LlmConfig,
-  options: { sourceRoot?: string; rootContext?: string } = {},
+  options: ForceReingestOptions = {},
 ): Promise<string[]> {
   if (!hasUsableLlm(llmConfig)) return []
   const pp = normalizePath(project.path)
+
+  if (options.clean) {
+    const purgeResult = await purgeWikiPagesForSources(pp, sourcePaths)
+    await clearIngestProgressCheckpointsForSources(pp, sourcePaths)
+    if (purgeResult.deletedWikiPaths.length > 0) {
+      try {
+        const { refreshProjectFileTree } = await import("@/lib/project-file-tree-refresh")
+        await refreshProjectFileTree(pp, { bumpDataVersion: true })
+      } catch (err) {
+        console.warn("[reingest] failed to refresh file tree after clean purge:", err)
+      }
+    }
+    console.log(
+      `[reingest] clean purge for ${sourcePaths.length} source(s): deleted ${purgeResult.deletedWikiPaths.length} wiki pages, rewrote ${purgeResult.rewrittenSourcePages} shared pages`,
+    )
+  }
 
   // Clear cache entries for every source so autoIngest runs the full
   // pipeline instead of short-circuiting on a cache hit.
@@ -582,7 +684,10 @@ export async function forceReingestSource(
 
   // Reuse the standard enqueue path — same folderContext logic, same
   // queue, same activity panel reporting.
-  return enqueueSourceIngest(project, sourcePaths, llmConfig, options)
+  return enqueueSourceIngest(project, sourcePaths, llmConfig, {
+    sourceRoot: options.sourceRoot,
+    rootContext: options.rootContext,
+  })
 }
 
 /**
@@ -596,6 +701,7 @@ export async function forceReingestSource(
 export async function forceReingestAllSources(
   project: WikiProject,
   llmConfig: LlmConfig,
+  options: Pick<ForceReingestOptions, "clean"> = {},
 ): Promise<string[]> {
   if (!hasUsableLlm(llmConfig)) return []
   const pp = normalizePath(project.path)
@@ -624,5 +730,6 @@ export async function forceReingestAllSources(
 
   return forceReingestSource(project, allFiles, llmConfig, {
     sourceRoot: sourcesRoot,
+    clean: options.clean,
   })
 }
