@@ -21,7 +21,9 @@ import {
   sourceIdentityForPath,
   sourceSummarySlugCandidatesFromIdentity,
   sourceSummarySlugFromIdentity,
+  extractDisplayTitle,
 } from "@/lib/source-identity"
+import { applyEncyclopediaStructuralLinks } from "@/lib/hub-linking"
 import { parseSources, writeSources } from "@/lib/sources-merge"
 import { checkIngestCache, saveIngestCache, INGEST_PIPELINE_VERSION } from "@/lib/ingest-cache"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
@@ -1610,6 +1612,7 @@ async function autoIngestImpl(
     if (!signal?.aborted && sourceSummaryPath) {
       ingestEncAggregate(activityId)
       let encAggregate = ""
+      const displayTitle = extractDisplayTitle(sourceContent, sourceIdentity)
       const entrySlugs = [...computeEntrySlugs(classifyHeadings(headingTree, 1).entries, fileSlugMode, fileName.replace(/\.[^.]+$/, ""), fileSlugNamespace).values()]
       await streamChat(
         llmConfig,
@@ -1620,6 +1623,7 @@ async function autoIngestImpl(
               "Generate aggregate FILE blocks for encyclopedia batch ingest.",
               `Source: ${sourceIdentity}`,
               `Source summary: ${sourceSummaryPath}`,
+              `Source display title (use for source summary title, NOT the file path): ${displayTitle}`,
               "Include index, overview, log updates and a rich source summary.",
               "Source summary body MUST contain at least 5 [[wikilink]] to major entries.",
               `Sample slugs: ${entrySlugs.slice(0, 15).join(", ")}`,
@@ -2001,6 +2005,31 @@ async function autoIngestImpl(
         `[ingest:strategy] encyclopedia drift check OK: ${writtenSlugs.size}/${expectedEntries} entries (${Math.round(driftRatio * 100)}%)`,
       )
     }
+
+    // Deterministic structural links (hub + parent/child) from heading tree.
+    if (!signal?.aborted && writtenPaths.length > 0) {
+      try {
+        const documentName = fileName.replace(/\.[^.]+$/, "")
+        const structuralResult = await applyEncyclopediaStructuralLinks({
+          projectPath: pp,
+          headingTree,
+          writtenPaths,
+          slugMode: fileSlugMode,
+          documentName,
+          slugNamespace: fileSlugNamespace,
+          sourceSummarySlug,
+        })
+        if (structuralResult.modifiedPaths.length > 0) {
+          console.log(
+            `[ingest:strategy] encyclopedia structural links: ${structuralResult.modifiedPaths.length} page(s) updated (hub=${structuralResult.hubSlug ?? "none"})`,
+          )
+        }
+      } catch (err) {
+        const msg = `Encyclopedia structural linking failed: ${err instanceof Error ? err.message : String(err)}`
+        console.warn(`[ingest:strategy] ${msg}`)
+        writeWarnings.push(msg)
+      }
+    }
   }
 
   // ── Post-generation validation (narrative + all strategies) ─────
@@ -2132,10 +2161,11 @@ async function autoIngestImpl(
   // task for retry rather than "success".
   if (!hasSourceSummary && !signal?.aborted) {
     const date = new Date().toISOString().slice(0, 10)
+    const displayTitle = extractDisplayTitle(sourceContent, sourceIdentity)
     const fallbackContent = [
       "---",
       `type: source`,
-      `title: "Source: ${sourceIdentity}"`,
+      `title: "${displayTitle.replace(/"/g, '\\"')}"`,
       `created: ${date}`,
       `updated: ${date}`,
       `sources: ["${sourceIdentity}"]`,
@@ -2143,7 +2173,7 @@ async function autoIngestImpl(
       `related: []`,
       "---",
       "",
-      `# Source: ${sourceIdentity}`,
+      `# ${displayTitle}`,
       "",
       analysis ? analysis.slice(0, 3000) : "(Analysis not available)",
       "",

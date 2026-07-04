@@ -137,3 +137,12 @@ function stableSlugHash(value: string): string {
   }
   return (hash >>> 0).toString(36)
 }
+
+/** Human-readable title for a source file (H1, else basename without extension). */
+export function extractDisplayTitle(sourceContent: string, sourceIdentity: string): string {
+  const h1 = /^#\s+(.+)$/m.exec(sourceContent)?.[1]?.trim()
+  if (h1) return h1
+
+  const basename = sourceIdentity.replace(/\.[^/.]+$/, "").split("/").pop() ?? sourceIdentity
+  return basename.replace(/[-_]+/g, " ").trim() || basename
+}

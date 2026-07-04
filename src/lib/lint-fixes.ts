@@ -13,10 +13,28 @@ function normalizedLintLinkTarget(target: string): string {
   return lintLinkTarget(target).toLowerCase()
 }
 
-function hasWikilinkToTarget(content: string, target: string): boolean {
+export function hasWikilinkToTarget(content: string, target: string): boolean {
   const normalized = normalizedLintLinkTarget(target)
   return Array.from(content.matchAll(/\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]/g))
     .some((match) => normalizedLintLinkTarget(match[1]) === normalized)
+}
+
+/** Append missing child slugs under ## Sub-entries (creates section if absent). */
+export function mergeSubEntriesSection(content: string, childSlugs: string[]): string {
+  const linesToAdd: string[] = []
+  for (const slug of childSlugs) {
+    const target = lintLinkTarget(slug)
+    if (hasWikilinkToTarget(content, target)) continue
+    linesToAdd.push(`- [[${target}]]`)
+  }
+  if (linesToAdd.length === 0) return content
+
+  const subHeading = /^##\s+Sub-entries\s*$/im.exec(content)
+  if (subHeading) {
+    const insertAt = subHeading.index + subHeading[0].length
+    return `${content.slice(0, insertAt)}\n${linesToAdd.join("\n")}${content.slice(insertAt)}`
+  }
+  return `${content.trimEnd()}\n\n## Sub-entries\n${linesToAdd.join("\n")}\n`
 }
 
 export function appendWikilink(content: string, target: string): string {

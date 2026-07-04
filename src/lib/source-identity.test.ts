@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   legacySourceSummarySlugFromIdentity,
+  extractDisplayTitle,
   sourceIdentityForPath,
   sourceReferenceIdentity,
   sourceSummarySlugCandidatesFromIdentity,
@@ -86,5 +87,20 @@ describe("source identity helpers", () => {
     expect(canonical).not.toContain("%")
     expect(legacy).toContain("%E6")
     expect(sourceSummarySlugCandidatesFromIdentity(identity)).toEqual([canonical, legacy])
+  })
+
+  it("extractDisplayTitle prefers H1 heading over basename", () => {
+    const content = "# Compendio dei Nani delle Montagne\n\nIntro.\n\n## Cultura\n"
+    expect(extractDisplayTitle(content, "Soeliok/GDR/compendio-nani.md")).toBe(
+      "Compendio dei Nani delle Montagne",
+    )
+  })
+
+  it("extractDisplayTitle humanizes basename when no H1", () => {
+    expect(extractDisplayTitle("plain text", "folder/my-source-file.md")).toBe("my source file")
+  })
+
+  it("extractDisplayTitle preserves Italian casing from H1", () => {
+    expect(extractDisplayTitle("# nani delle montagne\n", "nani.md")).toBe("nani delle montagne")
   })
 })
