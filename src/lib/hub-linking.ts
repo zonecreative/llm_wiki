@@ -21,6 +21,8 @@ export interface ApplyEncyclopediaStructuralLinksOptions {
   documentName: string
   slugNamespace?: string
   sourceSummarySlug: string
+  includeHubLinks?: boolean
+  includeHierarchyLinks?: boolean
 }
 
 export interface StructuralLinksResult {
@@ -151,15 +153,23 @@ export function relatePageToTarget(content: string, targetSlug: string): RelateP
   return { content: next, changed: next !== content }
 }
 
-export async function applyEncyclopediaStructuralLinks(
+export async function computeStructuralLinkChanges(
   opts: ApplyEncyclopediaStructuralLinksOptions,
-): Promise<StructuralLinksResult> {
+): Promise<{
+  pendingWrites: Map<string, string>
+  hubSlug: string | null
+  parentLinksAdded: number
+  subEntrySectionsUpdated: number
+  hubLinksAdded: number
+}> {
+  const includeHub = opts.includeHubLinks !== false
+  const includeHierarchy = opts.includeHierarchyLinks !== false
   const pp = normalizePath(opts.projectPath)
   const classification = classifyHeadings(opts.headingTree, 1)
   const entries = classification.entries
   if (entries.length === 0) {
     return {
-      modifiedPaths: [],
+      pendingWrites: new Map(),
       hubSlug: null,
       parentLinksAdded: 0,
       subEntrySectionsUpdated: 0,
@@ -174,13 +184,15 @@ export async function applyEncyclopediaStructuralLinks(
     opts.slugNamespace ?? "",
   )
   const childrenMap = buildChildrenSlugMap(entries, entrySlugs)
-  const hubSlug = await resolveDocumentHubSlug(
-    pp,
-    entries,
-    entrySlugs,
-    opts.sourceSummarySlug,
-    opts.writtenPaths,
-  )
+  const hubSlug = includeHub
+    ? await resolveDocumentHubSlug(
+        pp,
+        entries,
+        entrySlugs,
+        opts.sourceSummarySlug,
+        opts.writtenPaths,
+      )
+    : null
 
   const entryPaths = opts.writtenPaths.filter(
     (path) => isEncyclopediaEntryWikiPath(path) && !isStructuralSkipPath(path),
@@ -215,68 +227,100 @@ export async function applyEncyclopediaStructuralLinks(
     }
   }
 
-  for (const relativePath of entryPaths) {
-    const slug = slugFromWikiEntryPath(relativePath)
-    if (!slug) continue
-    const pathKey = slugToPathKey.get(slug.toLowerCase())
-    if (!pathKey) continue
-    const entry = entries.find((candidate) => candidate.pathKey === pathKey)
-    if (!entry) continue
+  if (includeHierarchy) {
+    for (const relativePath of entryPaths) {
+      const slug = slugFromWikiEntryPath(relativePath)
+      if (!slug) continue
+      const pathKey = slugToPathKey.get(slug.toLowerCase())
+      if (!pathKey) continue
+      const entry = entries.find((candidate) => candidate.pathKey === pathKey)
+      if (!entry) continue
 
-    const original = await loadContent(relativePath)
-    let content = original
+      const original = await loadContent(relativePath)
+      let content = original
 
-    const parentSlug = parentSlugForEntry(entry, entries, entrySlugs)
-    if (parentSlug) {
-      const parentPath = await resolveWikiPathForSlug(pp, parentSlug, opts.writtenPaths)
-      if (parentPath) {
-        const related = relatePageToTarget(content, parentSlug)
-        if (related.changed) {
-          parentLinksAdded += 1
-          content = related.content
+      const parentSlug = parentSlugForEntry(entry, entries, entrySlugs)
+      if (parentSlug) {
+        const parentPath = await resolveWikiPathForSlug(pp, parentSlug, opts.writtenPaths)
+        if (parentPath) {
+          const related = relatePageToTarget(content, parentSlug)
+          if (related.changed) {
+            parentLinksAdded += 1
+            content = related.content
+          }
         }
       }
+
+      stageWrite(relativePath, content, original)
     }
 
-    if (hubSlug && slug.toLowerCase() !== hubSlug.toLowerCase()) {
+    for (const [parentPathKey, childSlugs] of childrenMap) {
+      const parentSlug = entrySlugs.get(parentPathKey)
+      if (!parentSlug) continue
+      const parentRelPath = pathBySlug.get(parentSlug.toLowerCase())
+        ?? await resolveWikiPathForSlug(pp, parentSlug, opts.writtenPaths)
+      if (!parentRelPath) continue
+
+      const validChildren = (
+        await Promise.all(
+          childSlugs.map(async (childSlug) => {
+            const childPath = await resolveWikiPathForSlug(pp, childSlug, opts.writtenPaths)
+            return childPath ? childSlug : null
+          }),
+        )
+      ).filter((childSlug): childSlug is string => childSlug !== null)
+
+      if (validChildren.length === 0) continue
+
+      const original = await loadContent(parentRelPath)
+      const merged = mergeSubEntriesSection(original, validChildren)
+      if (merged !== original) {
+        subEntrySectionsUpdated += 1
+        stageWrite(parentRelPath, merged, original)
+      }
+    }
+  }
+
+  if (includeHub && hubSlug) {
+    for (const relativePath of entryPaths) {
+      const slug = slugFromWikiEntryPath(relativePath)
+      if (!slug || slug.toLowerCase() === hubSlug.toLowerCase()) continue
       const hubPath = await resolveWikiPathForSlug(pp, hubSlug, opts.writtenPaths)
-      if (hubPath) {
-        const related = relatePageToTarget(content, hubSlug)
-        if (related.changed) {
-          hubLinksAdded += 1
-          content = related.content
-        }
+      if (!hubPath) continue
+
+      const original = await loadContent(relativePath)
+      const related = relatePageToTarget(original, hubSlug)
+      if (related.changed) {
+        hubLinksAdded += 1
+        stageWrite(relativePath, related.content, original)
       }
     }
-
-    stageWrite(relativePath, content, original)
   }
 
-  for (const [parentPathKey, childSlugs] of childrenMap) {
-    const parentSlug = entrySlugs.get(parentPathKey)
-    if (!parentSlug) continue
-    const parentRelPath = pathBySlug.get(parentSlug.toLowerCase())
-      ?? await resolveWikiPathForSlug(pp, parentSlug, opts.writtenPaths)
-    if (!parentRelPath) continue
-
-    const validChildren = (
-      await Promise.all(
-        childSlugs.map(async (childSlug) => {
-          const childPath = await resolveWikiPathForSlug(pp, childSlug, opts.writtenPaths)
-          return childPath ? childSlug : null
-        }),
-      )
-    ).filter((childSlug): childSlug is string => childSlug !== null)
-
-    if (validChildren.length === 0) continue
-
-    const original = await loadContent(parentRelPath)
-    const merged = mergeSubEntriesSection(original, validChildren)
-    if (merged !== original) {
-      subEntrySectionsUpdated += 1
-      stageWrite(parentRelPath, merged, original)
-    }
+  return {
+    pendingWrites,
+    hubSlug,
+    parentLinksAdded,
+    subEntrySectionsUpdated,
+    hubLinksAdded,
   }
+}
+
+export async function applyEncyclopediaStructuralLinks(
+  opts: ApplyEncyclopediaStructuralLinksOptions,
+): Promise<StructuralLinksResult> {
+  const pp = normalizePath(opts.projectPath)
+  const {
+    pendingWrites,
+    hubSlug,
+    parentLinksAdded,
+    subEntrySectionsUpdated,
+    hubLinksAdded,
+  } = await computeStructuralLinkChanges({
+    ...opts,
+    includeHubLinks: opts.includeHubLinks !== false,
+    includeHierarchyLinks: opts.includeHierarchyLinks !== false,
+  })
 
   const modifiedPaths: string[] = []
   for (const [relativePath, content] of pendingWrites) {

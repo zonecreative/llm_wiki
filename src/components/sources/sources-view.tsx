@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, RotateCw, RefreshCcw } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, RotateCw, RefreshCcw, Link2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
@@ -22,6 +22,7 @@ import {
   forceReingestAllSources,
 } from "@/lib/source-lifecycle"
 import { BatchIngestDialog } from "./batch-ingest-dialog"
+import { LinkRepairDialog } from "./link-repair-dialog"
 import { filterRawSourceTree } from "@/lib/source-filter"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 
@@ -59,6 +60,7 @@ export function SourcesView() {
   const [reingestAllClean, setReingestAllClean] = useState(false)
   const [cleanReingestTarget, setCleanReingestTarget] = useState<FileNode | null>(null)
   const [showBatchDialog, setShowBatchDialog] = useState(false)
+  const [linkRepairTarget, setLinkRepairTarget] = useState<FileNode | null>(null)
 
   // Auto-disarm: 5 seconds without a second click resets the
   // pending state. Prevents a stale armed button from firing if
@@ -397,6 +399,7 @@ export function SourcesView() {
               onIngest={handleIngest}
               onForceReingest={handleForceReingest}
               onCleanReingest={(node) => setCleanReingestTarget(node)}
+              onLinkRepair={(node) => setLinkRepairTarget(node)}
               onDelete={handleDelete}
               onDeleteFolder={handleDeleteFolder}
               pendingDeletePath={pendingDeletePath}
@@ -434,6 +437,15 @@ export function SourcesView() {
         open={showBatchDialog}
         onClose={() => setShowBatchDialog(false)}
       />
+
+      {linkRepairTarget && (
+        <LinkRepairDialog
+          open={!!linkRepairTarget}
+          onClose={() => setLinkRepairTarget(null)}
+          sourcePath={linkRepairTarget.path}
+          sourceName={linkRepairTarget.name}
+        />
+      )}
 
       {showReingestAllConfirm && (
         <div
@@ -582,6 +594,7 @@ function SourceTree({
   onIngest,
   onForceReingest,
   onCleanReingest,
+  onLinkRepair,
   onDelete,
   onDeleteFolder,
   pendingDeletePath,
@@ -593,6 +606,7 @@ function SourceTree({
   onIngest: (node: FileNode) => void
   onForceReingest: (node: FileNode) => void
   onCleanReingest: (node: FileNode) => void
+  onLinkRepair: (node: FileNode) => void
   onDelete: (node: FileNode) => void
   onDeleteFolder: (node: FileNode) => void
   /** Path of the node currently in "click again to confirm" state.
@@ -719,6 +733,15 @@ function SourceTree({
               onClick={() => onIngest(node)}
             >
               <BookOpen className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
+              title={t("sources.linkRepairButton")}
+              onClick={() => onLinkRepair(node)}
+            >
+              <Link2 className="h-4 w-4" />
             </Button>
             <Button
               variant="ghost"
