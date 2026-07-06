@@ -259,6 +259,8 @@
       "orphan": "Orphan Page",
       "broken-link": "Broken Link",
       "no-outlinks": "No Outbound Links",
+      "missing-hub-link": "Missing Hub Link",
+      "missing-parent-link": "Missing Parent Link",
       "semantic": "Semantic Issue"
     },
     "issues": "{{count}} issue",

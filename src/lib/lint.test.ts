@@ -245,4 +245,95 @@ describe("runStructuralLint — link suggestions", () => {
 
     expect(broken?.suggestedTarget).toBeUndefined()
   })
+
+  it("flags missing hub and parent wikilinks on encyclopedia pages", async () => {
+    const pages = [
+      makeFileNode(
+        "concepts/hub.md",
+        [
+          "---",
+          "title: Hub",
+          "ingest_strategy: encyclopedia",
+          "---",
+          "# Hub",
+          "Root entry.",
+        ].join("\n"),
+      ),
+      makeFileNode(
+        "concepts/child.md",
+        [
+          "---",
+          "title: Child",
+          "ingest_strategy: encyclopedia",
+          "parent: concepts/parent.md",
+          "ancestor: concepts/hub.md",
+          "---",
+          "# Child",
+          "No structural links yet.",
+        ].join("\n"),
+      ),
+      makeFileNode(
+        "concepts/parent.md",
+        [
+          "---",
+          "title: Parent",
+          "ingest_strategy: encyclopedia",
+          "parent: concepts/hub.md",
+          "ancestor: concepts/hub.md",
+          "---",
+          "# Parent",
+          "Also missing links.",
+        ].join("\n"),
+      ),
+    ]
+    mockListDirectory.mockResolvedValue(pages.map((p) => p.node))
+    mockReadFile.mockImplementation(async (path) => {
+      const match = pages.find((p) => p.node.path === path)
+      return match?.content ?? ""
+    })
+
+    const results = await runStructuralLint("/project")
+    const missingHub = results.find(
+      (result) => result.type === "missing-hub-link" && result.page === "concepts/child.md",
+    )
+    const missingParent = results.find(
+      (result) => result.type === "missing-parent-link" && result.page === "concepts/child.md",
+    )
+
+    expect(missingHub?.suggestedTarget).toBe("concepts/hub.md")
+    expect(missingParent?.suggestedTarget).toBe("concepts/parent.md")
+  })
+
+  it("does not flag structural links when body wikilinks already exist", async () => {
+    const pages = [
+      makeFileNode(
+        "concepts/hub.md",
+        "---\ntitle: Hub\ningest_strategy: encyclopedia\n---\n# Hub",
+      ),
+      makeFileNode(
+        "concepts/child.md",
+        [
+          "---",
+          "title: Child",
+          "ingest_strategy: encyclopedia",
+          "parent: concepts/hub.md",
+          "ancestor: concepts/hub.md",
+          "---",
+          "# Child",
+          "See [[concepts/hub]] for context.",
+        ].join("\n"),
+      ),
+    ]
+    mockListDirectory.mockResolvedValue(pages.map((p) => p.node))
+    mockReadFile.mockImplementation(async (path) => {
+      const match = pages.find((p) => p.node.path === path)
+      return match?.content ?? ""
+    })
+
+    const results = await runStructuralLint("/project")
+    const childIssues = results.filter((result) => result.page === "concepts/child.md")
+
+    expect(childIssues.some((result) => result.type === "missing-hub-link")).toBe(false)
+    expect(childIssues.some((result) => result.type === "missing-parent-link")).toBe(false)
+  })
 })

@@ -252,6 +252,8 @@
       "orphan": "孤立页面",
       "broken-link": "失效链接",
       "no-outlinks": "无出站链接",
+      "missing-hub-link": "缺少文档 hub 链接",
+      "missing-parent-link": "缺少父级链接",
       "semantic": "语义问题"
     },
     "issues": "{{count}} 个问题",

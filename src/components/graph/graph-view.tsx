@@ -74,6 +74,7 @@ type GraphThemePalette = {
   mutedNodeMixTarget: string
   dimmedEdge: string
   activeEdge: string
+  structuralEdge: string
 }
 
 const BASE_NODE_SIZE = 8
@@ -101,6 +102,7 @@ function graphThemePalette(isDark: boolean): GraphThemePalette {
         mutedNodeMixTarget: "#334155",
         dimmedEdge: "rgba(71,85,105,0.12)",
         activeEdge: "#38bdf8",
+        structuralEdge: "rgba(167,139,250,0.45)",
       }
     : {
         defaultEdge: "#cbd5e1",
@@ -112,6 +114,7 @@ function graphThemePalette(isDark: boolean): GraphThemePalette {
         mutedNodeMixTarget: "#e2e8f0",
         dimmedEdge: "rgba(148,163,184,0.22)",
         activeEdge: "#1e293b",
+        structuralEdge: "rgba(124,58,237,0.35)",
       }
 }
 
@@ -268,7 +271,7 @@ function labelDensity(nodeCount: number): number {
 function graphDataKey(nodes: readonly GraphNode[], edges: readonly GraphEdge[], graphSpacing: number): string {
   const nodeIds = nodes.map((n) => n.id).sort()
   const edgeIds = edges
-    .map((e) => `${e.source}->${e.target}:${Math.round(e.weight * 1000)}`)
+    .map((e) => `${e.source}->${e.target}:${Math.round(e.weight * 1000)}:${e.structural ? "s" : "w"}`)
     .sort()
   return `${hashParts(nodeIds)}:${hashParts(edgeIds)}:${nodes.length}:${edges.length}:${graphSpacing.toFixed(2)}`
 }
@@ -354,10 +357,12 @@ function GraphLoader({
         const edgeKey = `${edge.source}->${edge.target}`
         if (!graph.hasEdge(edgeKey) && !graph.hasEdge(`${edge.target}->${edge.source}`)) {
           const normalizedWeight = edge.weight / maxWeight // 0..1
-          const size = 0.5 + normalizedWeight * 3.5 // 0.5..4
-          // Stronger relationships → darker color
+          const isStructural = edge.structural === true
+          const size = isStructural ? 0.9 : 0.5 + normalizedWeight * 3.5 // 0.5..4
           const alpha = Math.round(40 + normalizedWeight * 180) // 40..220
-          const color = `rgba(100,116,139,${alpha / 255})` // slate-500 with variable opacity
+          const color = isStructural
+            ? undefined
+            : `rgba(100,116,139,${alpha / 255})` // slate-500 with variable opacity
           graph.addEdgeWithKey(edgeKey, edge.source, edge.target, {
             color,
             size,
@@ -365,7 +370,8 @@ function GraphLoader({
             normalizedWeight,
             sourceNode: edge.source,
             targetNode: edge.target,
-            lowPriority: weakEdgeThreshold > 0 && normalizedWeight < weakEdgeThreshold,
+            structural: isStructural,
+            lowPriority: !isStructural && weakEdgeThreshold > 0 && normalizedWeight < weakEdgeThreshold,
           })
         }
       }
@@ -510,14 +516,22 @@ function GraphRenderSettings({
         const hasHighlight = highlightedNodes.size > 0
         const hoverEdge = hasHover && (source === hoverState?.node || target === hoverState?.node)
         const highlightedEdge = hasHighlight && highlightedNodes.has(source) && highlightedNodes.has(target)
+        const isStructural = attrs.structural === true
 
-        if (attrs.lowPriority && !hoverEdge && !highlightedEdge) {
+        if (isStructural) {
+          result.color = palette.structuralEdge
+          result.size = 0.9
+        }
+
+        if (attrs.lowPriority && !hoverEdge && !highlightedEdge && !isStructural) {
           result.hidden = true
           return result
         }
         if ((hasHover && !hoverEdge) || (hasHighlight && !highlightedEdge)) {
-          result.color = palette.dimmedEdge
-          result.size = 0.3
+          if (!isStructural) {
+            result.color = palette.dimmedEdge
+            result.size = 0.3
+          }
         }
         if (hoverEdge || highlightedEdge) {
           result.color = palette.activeEdge

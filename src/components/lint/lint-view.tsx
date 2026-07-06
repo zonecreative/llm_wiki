@@ -11,6 +11,7 @@ import {
   Wrench,
   Trash2,
   Link,
+  GitBranch,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -61,6 +62,8 @@ export function LintView() {
     orphan: { icon: Unlink, label: t("lint.typeLabels.orphan") },
     "broken-link": { icon: Link2Off, label: t("lint.typeLabels.broken-link") },
     "no-outlinks": { icon: ArrowUpRight, label: t("lint.typeLabels.no-outlinks") },
+    "missing-hub-link": { icon: Link, label: t("lint.typeLabels.missing-hub-link") },
+    "missing-parent-link": { icon: GitBranch, label: t("lint.typeLabels.missing-parent-link") },
     semantic: { icon: BrainCircuit, label: t("lint.typeLabels.semantic") },
   }), [t])
 
@@ -139,7 +142,9 @@ export function LintView() {
         break
       }
       case "orphan":
-      case "no-outlinks": {
+      case "no-outlinks":
+      case "missing-hub-link":
+      case "missing-parent-link": {
         useReviewStore.getState().addItem({
           type: "suggestion",
           title: t("lint.addCrossRefs", { page: item.page }),
@@ -203,7 +208,9 @@ export function LintView() {
           break
         }
 
-        case "no-outlinks": {
+        case "no-outlinks":
+        case "missing-hub-link":
+        case "missing-parent-link": {
           if (item.suggestedTarget) {
             const pagePath = `${pp}/wiki/${item.page}`
             const content = await readFile(pagePath)
@@ -215,8 +222,8 @@ export function LintView() {
           break
         }
 
+        case "semantic":
         default: {
-          // Semantic issues → send to Review for manual resolution
           addLintItemToReview(item)
           useLintStore.getState().removeItem(item.id)
           break

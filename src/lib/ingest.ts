@@ -23,7 +23,7 @@ import {
   sourceSummarySlugFromIdentity,
   extractDisplayTitle,
 } from "@/lib/source-identity"
-import { applyEncyclopediaStructuralLinks } from "@/lib/hub-linking"
+import { applyEncyclopediaStructuralLinks, buildChildrenSlugMap, parentSlugForEntry } from "@/lib/hub-linking"
 import { parseSources, writeSources } from "@/lib/sources-merge"
 import { checkIngestCache, saveIngestCache, INGEST_PIPELINE_VERSION } from "@/lib/ingest-cache"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
@@ -1296,6 +1296,16 @@ async function autoIngestImpl(
       // No checkpoint — start from scratch
     }
 
+    const encClassification = classifyHeadings(headingTree, 1)
+    const encDocumentName = fileName.replace(/\.[^.]+$/, "")
+    const encEntrySlugs = computeEntrySlugs(
+      encClassification.entries,
+      fileSlugMode,
+      encDocumentName,
+      fileSlugNamespace,
+    )
+    const encChildrenMap = buildChildrenSlugMap(encClassification.entries, encEntrySlugs)
+
     for (let i = completedBatches; i < encyclopediaBatches.length; i++) {
       if (signal?.aborted) throw new Error("Ingest cancelled")
       const batch = encyclopediaBatches[i]
@@ -1306,13 +1316,19 @@ async function autoIngestImpl(
       // passing the full sourceContext (a digest for long docs), we
       // pass the real heading content for each entry in this batch.
       const entryContents = batch.map((entry) => {
-        const slug = computeEncyclopediaSlug(entry, fileSlugMode, fileName.replace(/\.[^.]+$/, ""), fileSlugNamespace)
+        const slug = computeEncyclopediaSlug(entry, fileSlugMode, encDocumentName, fileSlugNamespace)
+        const children = encChildrenMap.get(entry.pathKey)
+        const childInfo = children && children.length > 0
+          ? ` [children: ${children.join(", ")}]`
+          : ""
+        const parentSlug = parentSlugForEntry(entry, encClassification.entries, encEntrySlugs)
         return [
           `### Entry: ${entry.title}`,
-          `Slug: ${slug}`,
+          `Slug: ${slug}${childInfo}`,
           `Heading path: ${entry.headingPath.join(" > ")}`,
           `Level: ${entry.level}`,
           entry.parent ? `Parent: ${entry.parent}` : "Parent: (top-level)",
+          parentSlug ? `Parent slug: ${parentSlug}` : "Parent slug: (none)",
           "",
           "Content:",
           entry.content,
@@ -1357,6 +1373,13 @@ async function autoIngestImpl(
               "  - `heading_level`: heading level (1, 2, ...)",
               "  - `heading_path`: array of heading titles from root to this entry",
               "  - `ingest_strategy: encyclopedia`",
+              "",
+              "## Parent-child linking (CRITICAL)",
+              "If an entry has [children: ...] in its slug line:",
+              "- Include a `## Sub-entries` section listing each child as `[[child-slug]]`",
+              "If an entry has a Parent slug:",
+              "- Add the parent slug to `related` frontmatter",
+              "- Mention the parent in the body with `[[parent-slug]]`",
               "",
               "## Output Format",
               "FILE block template:",

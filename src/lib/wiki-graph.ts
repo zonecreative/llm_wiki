@@ -1,6 +1,7 @@
 import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { buildRetrievalGraph, calculateRelevance } from "./graph-relevance"
+import { parseFrontmatter } from "@/lib/frontmatter"
 import { normalizePath } from "@/lib/path-utils"
 import Graph from "graphology"
 import louvain from "graphology-communities-louvain"
@@ -18,6 +19,8 @@ export interface GraphEdge {
   source: string
   target: string
   weight: number // relevance score between source and target
+  /** Frontmatter parent/ancestor — not from body wikilinks */
+  structural?: boolean
 }
 
 export interface CommunityInfo {
@@ -152,6 +155,13 @@ function extractWikilinks(content: string): string[] {
   return links
 }
 
+function frontmatterSlug(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed === "null" || trimmed === "None") return null
+  return trimmed
+}
+
 function fileNameToId(fileName: string): string {
   return fileName.replace(/\.md$/, "")
 }
@@ -176,7 +186,15 @@ export async function buildWikiGraph(
   // Build a map of id -> node data
   const nodeMap = new Map<
     string,
-    { id: string; label: string; type: string; path: string; links: string[] }
+    {
+      id: string
+      label: string
+      type: string
+      path: string
+      links: string[]
+      parentSlug: string | null
+      ancestorSlug: string | null
+    }
   >()
 
   for (const file of mdFiles) {
@@ -189,12 +207,16 @@ export async function buildWikiGraph(
       continue
     }
 
+    const parsed = parseFrontmatter(content)
+    const fm = parsed.frontmatter ?? {}
     nodeMap.set(id, {
       id,
       label: extractTitle(content, file.name),
       type: extractType(content),
       path: file.path,
       links: extractWikilinks(content),
+      parentSlug: frontmatterSlug(fm.parent),
+      ancestorSlug: frontmatterSlug(fm.ancestor),
     })
   }
 
@@ -218,7 +240,6 @@ export async function buildWikiGraph(
 
   for (const [sourceId, nodeData] of nodeMap) {
     for (const targetRaw of nodeData.links) {
-      // Normalize target: try matching by id (case-insensitive, hyphen/space)
       const targetId = resolveTarget(targetRaw, nodeMap)
       if (targetId === null) continue
       if (targetId === sourceId) continue
@@ -228,19 +249,34 @@ export async function buildWikiGraph(
       linkCounts.set(sourceId, (linkCounts.get(sourceId) ?? 0) + 1)
       linkCounts.set(targetId, (linkCounts.get(targetId) ?? 0) + 1)
     }
-  }
 
-  // Deduplicate edges
-  const seenEdges = new Set<string>()
-  const dedupedEdges: { source: string; target: string }[] = []
-  for (const edge of rawEdges) {
-    const key = `${edge.source}:::${edge.target}`
-    const reverseKey = `${edge.target}:::${edge.source}`
-    if (!seenEdges.has(key) && !seenEdges.has(reverseKey)) {
-      seenEdges.add(key)
-      dedupedEdges.push(edge)
+    for (const targetRaw of [nodeData.parentSlug, nodeData.ancestorSlug]) {
+      if (!targetRaw) continue
+      const targetId = resolveTarget(targetRaw, nodeMap)
+      if (targetId === null || targetId === sourceId) continue
+
+      rawEdges.push({ source: sourceId, target: targetId, weight: 0.35, structural: true })
+
+      linkCounts.set(sourceId, (linkCounts.get(sourceId) ?? 0) + 1)
+      linkCounts.set(targetId, (linkCounts.get(targetId) ?? 0) + 1)
     }
   }
+
+  // Deduplicate edges — body wikilinks win over structural frontmatter
+  const edgeByKey = new Map<string, GraphEdge>()
+  for (const edge of rawEdges) {
+    const key = [edge.source, edge.target].sort().join(":::")
+    const existing = edgeByKey.get(key)
+    if (!existing) {
+      edgeByKey.set(key, { ...edge })
+      continue
+    }
+    if (edge.structural && !existing.structural) continue
+    if (!edge.structural) {
+      edgeByKey.set(key, { ...edge, structural: false })
+    }
+  }
+  const dedupedEdges = Array.from(edgeByKey.values())
 
   // Calculate relevance weights using the retrieval graph
   let retrievalGraph: Awaited<ReturnType<typeof buildRetrievalGraph>> | null = null
@@ -261,7 +297,12 @@ export async function buildWikiGraph(
         weight = calculateRelevance(nodeA, nodeB, retrievalGraph)
       }
     }
-    return { source: e.source, target: e.target, weight }
+    return {
+      source: e.source,
+      target: e.target,
+      weight: e.structural ? Math.min(weight, 0.35) : weight,
+      structural: e.structural,
+    }
   })
 
   // Build preliminary nodes for community detection

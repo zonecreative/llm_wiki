@@ -5,9 +5,17 @@ import type { FileNode } from "@/types/wiki"
 import { useActivityStore } from "@/stores/activity-store"
 import { getFileName, getRelativePath, normalizePath } from "@/lib/path-utils"
 import { buildLanguageDirective } from "@/lib/output-language"
+import { parseFrontmatter } from "@/lib/frontmatter"
+import { hasWikilinkToTarget } from "@/lib/lint-fixes"
 
 export interface LintResult {
-  type: "orphan" | "broken-link" | "no-outlinks" | "semantic"
+  type:
+    | "orphan"
+    | "broken-link"
+    | "no-outlinks"
+    | "missing-hub-link"
+    | "missing-parent-link"
+    | "semantic"
   severity: "warning" | "info"
   page: string
   detail: string
@@ -60,6 +68,19 @@ function normalizeLinkTarget(target: string): string {
     .replace(/\.md$/i, "")
     .trim()
     .toLowerCase()
+}
+
+function frontmatterSlug(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed === "null" || trimmed === "None") return null
+  return trimmed
+}
+
+function slugExistsInMap(slug: string, slugMap: Map<string, string>): boolean {
+  const normalized = normalizeLinkTarget(slug)
+  const basename = getFileName(normalized).toLowerCase()
+  return slugMap.has(normalized) || slugMap.has(basename)
 }
 
 function extractTitle(content: string, fallbackPath: string): string {
@@ -173,6 +194,9 @@ export async function runStructuralLint(projectPath: string): Promise<LintResult
     content: string
     outlinks: string[]
     tokens: Set<string>
+    ingestStrategy?: string
+    parentSlug?: string | null
+    ancestorSlug?: string | null
   }
   const pages: PageData[] = []
 
@@ -185,7 +209,20 @@ export async function runStructuralLint(projectPath: string): Promise<LintResult
       const outlinks = extractWikilinks(content)
       const slugName = getFileName(slug)
       const tokens = tokenizeForSuggestion(`${title}\n${slugName}\n${content.slice(0, SUGGESTION_TOKEN_WINDOW)}`)
-      pages.push({ path: f.path, shortName, slug, title, content, outlinks, tokens })
+      const parsed = parseFrontmatter(content)
+      const fm = parsed.frontmatter ?? {}
+      pages.push({
+        path: f.path,
+        shortName,
+        slug,
+        title,
+        content,
+        outlinks,
+        tokens,
+        ingestStrategy: typeof fm.ingest_strategy === "string" ? fm.ingest_strategy : undefined,
+        parentSlug: frontmatterSlug(fm.parent),
+        ancestorSlug: frontmatterSlug(fm.ancestor),
+      })
     } catch {
       // skip unreadable files
     }
@@ -290,6 +327,47 @@ export async function runStructuralLint(projectPath: string): Promise<LintResult
           brokenTarget: link,
           suggestedTarget: suggestedTarget?.shortName,
         })
+      }
+    }
+
+    // Encyclopedia structural links from frontmatter metadata
+    if (p.ingestStrategy === "encyclopedia") {
+      const pageSlugKey = normalizeLinkTarget(p.slug)
+
+      if (p.ancestorSlug && slugExistsInMap(p.ancestorSlug, slugMap)) {
+        const ancestorKey = normalizeLinkTarget(p.ancestorSlug)
+        const isSelf = ancestorKey === pageSlugKey
+          || getFileName(ancestorKey) === getFileName(pageSlugKey)
+        if (!isSelf && !hasWikilinkToTarget(p.content, p.ancestorSlug)) {
+          results.push({
+            type: "missing-hub-link",
+            severity: "info",
+            page: shortName,
+            detail: `Missing document hub link to [[${p.ancestorSlug}]] (from ancestor frontmatter).`,
+            suggestedTarget: p.ancestorSlug,
+          })
+        }
+      }
+
+      if (p.parentSlug && slugExistsInMap(p.parentSlug, slugMap)) {
+        const parentKey = normalizeLinkTarget(p.parentSlug)
+        const isSelf = parentKey === pageSlugKey
+          || getFileName(parentKey) === getFileName(pageSlugKey)
+        const sameAsAncestor = p.ancestorSlug
+          && normalizeLinkTarget(p.ancestorSlug) === parentKey
+        if (
+          !isSelf
+          && !sameAsAncestor
+          && !hasWikilinkToTarget(p.content, p.parentSlug)
+        ) {
+          results.push({
+            type: "missing-parent-link",
+            severity: "info",
+            page: shortName,
+            detail: `Missing parent link to [[${p.parentSlug}]] (from parent frontmatter).`,
+            suggestedTarget: p.parentSlug,
+          })
+        }
       }
     }
   }
