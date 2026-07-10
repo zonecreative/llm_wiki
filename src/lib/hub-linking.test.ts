@@ -5,9 +5,11 @@ import {
   buildChildrenSlugMap,
   buildEntrySlugMap,
   findWikiPathForSlug,
+  inferSlugModeForEntries,
   isEncyclopediaEntryWikiPath,
   parentSlugForEntry,
   relatePageToTarget,
+  relatePageToTargets,
   slugFromWikiEntryPath,
 } from "@/lib/hub-linking"
 import { mergeSubEntriesSection } from "@/lib/lint-fixes"
@@ -68,10 +70,43 @@ describe("hub-linking helpers", () => {
     expect(result.content).toContain("[[parent-slug]]")
   })
 
+  it("relatePageToTargets appends full hierarchy chain", () => {
+    const content = "---\ntitle: x\n---\n\nBody text.\n"
+    const result = relatePageToTargets(content, ["parent-slug", "ancestor-slug"])
+    expect(result.changed).toBe(true)
+    expect(result.content).toContain("[[parent-slug]]")
+    expect(result.content).toContain("[[ancestor-slug]]")
+  })
+
   it("mergeSubEntriesSection merges without duplicating existing child", () => {
     const content = "---\ntitle: x\n---\n\n## Sub-entries\n- [[child-a]]\n"
     const merged = mergeSubEntriesSection(content, ["child-a", "child-b"])
     expect(merged.match(/\[\[child-a\]\]/g)?.length).toBe(1)
     expect(merged).toContain("[[child-b]]")
+  })
+
+  it("inferSlugModeForEntries picks mode matching written wiki slugs", () => {
+    const writtenPaths = Array.from(entrySlugs.values()).map(
+      (slug) => `wiki/concepts/${slug}.md`,
+    )
+    expect(inferSlugModeForEntries(
+      classification.entries,
+      "compendio-nani",
+      writtenPaths,
+      "",
+      "default",
+    )).toBe("default")
+
+    const docH1LeafSlugs = buildEntrySlugMap(classification.entries, "doc-h1-leaf", "compendio-nani", "")
+    const docH1Paths = Array.from(docH1LeafSlugs.values()).map(
+      (slug) => `wiki/concepts/${slug}.md`,
+    )
+    expect(inferSlugModeForEntries(
+      classification.entries,
+      "compendio-nani",
+      docH1Paths,
+      "",
+      "default",
+    )).toBe("doc-h1-leaf")
   })
 })

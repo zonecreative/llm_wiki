@@ -28,7 +28,8 @@
   },
   "sidebar": {
     "knowledge": "知识库",
-    "files": "文件"
+    "files": "文件",
+    "rawSources": "原始来源"
   },
   "research": {
     "title": "深度研究",
@@ -133,9 +134,13 @@
     "batchMergeAllHint": "保留现有 wiki 页面并与新导入结果合并",
     "batchCleanFile": "清空",
     "batchCleanFileHint": "导入前删除该来源生成的 wiki 页面（不合并）",
+    "fileActionsMenu": "文件操作（导入、链接修复、重新导入）",
+    "forceReingestShort": "强制重新导入",
+    "cleanReingestShort": "清理后重新导入",
     "linkRepairButton": "链接修复（文档 hub、层级或自定义关联）",
     "linkRepairTitle": "链接修复",
     "linkRepairPageCount": "该来源的 {{count}} 个百科页面",
+    "linkRepairTabH1Index": "H1 章节",
     "linkRepairTabHub": "文档 hub",
     "linkRepairTabHierarchy": "层级",
     "linkRepairTabCustom": "自定义目标",
@@ -147,6 +152,7 @@
     "linkRepairSelectUnlinked": "仅选未链接",
     "linkRepairPlanning": "正在分析页面（预览）…",
     "linkRepairNoPages": "未找到该来源的百科 wiki 页面。",
+    "linkRepairNoChanges": "已找到页面，但当前修复模式下所有内容均已匹配，无需更改。",
     "linkRepairAlreadyLinked": "已链接",
     "linkRepairWillLink": "→ [[{{target}}]]",
     "linkRepairNoChange": "无需更改",
@@ -154,7 +160,13 @@
     "linkRepairApply": "备份后应用",
     "linkRepairApplying": "正在应用…",
     "linkRepairDone": "已更新 {{count}} 个页面。",
-    "linkRepairBackupPath": "备份：{{path}}"
+    "linkRepairBackupPath": "备份：{{path}}",
+    "linkRepairActionableCount": "{{actionable}} 待更新 · 共 {{total}} 页",
+    "linkRepairShowAll": "显示全部页面",
+    "linkRepairShowActionableOnly": "仅显示待处理",
+    "linkRepairResolvedSlugMode": "检测到的 slug 模式：{{mode}}",
+    "linkRepairMissingParentPage": "父页面不在 wiki 中",
+    "linkRepairH1Exists": "章节索引已存在"
   },
   "chat": {
     "placeholder": "向你的 Wiki 提问...",

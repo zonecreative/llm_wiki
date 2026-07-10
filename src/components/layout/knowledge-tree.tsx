@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react"
 import {
   FileText, Users, Lightbulb, BookOpen, HelpCircle, GitMerge, BarChart3, TrendingUp, Target, ChevronRight, ChevronDown, Layout, Globe, Trash2, RotateCw,
 } from "lucide-react"
+import { useTranslation } from "react-i18next"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Button } from "@/components/ui/button"
 import { useWikiStore } from "@/stores/wiki-store"
@@ -11,10 +12,12 @@ import { normalizePath } from "@/lib/path-utils"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { cascadeDeleteWikiPagesWithRefs } from "@/lib/wiki-page-delete"
 import { inferWikiTypeFromPath, wikiTypeLabel } from "@/lib/wiki-page-types"
-import { forceReingestSource, forceReingestAllSources } from "@/lib/source-lifecycle"
+import { forceReingestSource, forceReingestAllSources, enqueueSourceIngest } from "@/lib/source-lifecycle"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
 import { useActivityStore } from "@/stores/activity-store"
 import { BatchIngestDialog } from "@/components/sources/batch-ingest-dialog"
+import { LinkRepairDialog } from "@/components/sources/link-repair-dialog"
+import { SourceFileActionsMenu } from "@/components/sources/source-file-actions-menu"
 import { filterRawSourceTree } from "@/lib/source-filter"
 
 interface WikiPageInfo {
@@ -343,6 +346,7 @@ export function KnowledgeTree() {
 }
 
 function RawSourcesSection() {
+  const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const llmConfig = useWikiStore((s) => s.llmConfig)
   const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
@@ -353,6 +357,8 @@ function RawSourcesSection() {
   const [reingestingAll, setReingestingAll] = useState(false)
   const [showReingestConfirm, setShowReingestConfirm] = useState(false)
   const [showBatchDialog, setShowBatchDialog] = useState(false)
+  const [openActionsPath, setOpenActionsPath] = useState<string | null>(null)
+  const [linkRepairTarget, setLinkRepairTarget] = useState<FileNode | null>(null)
 
   useEffect(() => {
     if (!project) return
@@ -362,9 +368,28 @@ function RawSourcesSection() {
       .catch(() => setSources([]))
   }, [project])
 
+  useEffect(() => {
+    if (!openActionsPath) return
+    const close = () => setOpenActionsPath(null)
+    document.addEventListener("pointerdown", close)
+    return () => document.removeEventListener("pointerdown", close)
+  }, [openActionsPath])
+
   if (sources.length === 0) return null
 
   const llmReady = hasUsableLlm(llmConfig)
+
+  async function handleIngestOne(file: FileNode) {
+    if (!project || ingestingPath || !llmReady) return
+    setIngestingPath(file.path)
+    try {
+      await enqueueSourceIngest(project, [file.path], llmConfig)
+    } catch (err) {
+      console.error("[RawSources] ingest failed:", err)
+    } finally {
+      setIngestingPath(null)
+    }
+  }
 
   async function handleReingestOne(file: FileNode) {
     if (!project || ingestingPath || !llmReady) return
@@ -373,6 +398,20 @@ function RawSourcesSection() {
       await forceReingestSource(project, [file.path], llmConfig)
     } catch (err) {
       console.error("[RawSources] re-ingest failed:", err)
+    } finally {
+      setIngestingPath(null)
+    }
+  }
+
+  async function handleCleanReingestOne(file: FileNode) {
+    if (!project || ingestingPath || !llmReady) return
+    const confirmed = window.confirm(t("sources.cleanReingestConfirm", { name: file.name }))
+    if (!confirmed) return
+    setIngestingPath(file.path)
+    try {
+      await forceReingestSource(project, [file.path], llmConfig, { clean: true })
+    } catch (err) {
+      console.error("[RawSources] clean re-ingest failed:", err)
     } finally {
       setIngestingPath(null)
     }
@@ -404,7 +443,9 @@ function RawSourcesSection() {
             <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           )}
           <BookOpen className="h-3.5 w-3.5 shrink-0 text-amber-600" />
-          <span className="flex-1 text-left font-medium text-muted-foreground">Raw Sources</span>
+          <span className="flex-1 text-left font-medium text-muted-foreground">
+            {t("sidebar.rawSources", { defaultValue: "Raw Sources" })}
+          </span>
           <span className="text-xs text-muted-foreground">{sources.length}</span>
         </button>
         {llmReady && sources.length > 0 && (
@@ -434,7 +475,7 @@ function RawSourcesSection() {
               >
                 <button
                   onClick={() => openPathInPreview(file.path)}
-                  className={`flex flex-1 items-center gap-1.5 px-2 py-1 text-left text-sm min-w-0 ${
+                  className={`flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1 text-left text-sm ${
                     isSelected
                       ? "text-accent-foreground"
                       : "text-muted-foreground group-hover:text-accent-foreground"
@@ -444,21 +485,21 @@ function RawSourcesSection() {
                   <span className="truncate">{file.name}</span>
                 </button>
                 {llmReady && (
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className={`h-6 w-6 shrink-0 text-muted-foreground hover:text-primary transition-opacity ${
-                      isIngesting ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-                    }`}
-                    disabled={isIngesting}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      void handleReingestOne(file)
+                  <SourceFileActionsMenu
+                    node={file}
+                    compact
+                    open={openActionsPath === file.path}
+                    ingesting={isIngesting}
+                    onToggle={(event) => {
+                      event.stopPropagation()
+                      setOpenActionsPath((current) => (current === file.path ? null : file.path))
                     }}
-                    title="Force re-ingest (clear cache + re-run)"
-                  >
-                    <RotateCw className={`h-3 w-3 ${isIngesting ? "animate-spin" : ""}`} />
-                  </Button>
+                    onClose={() => setOpenActionsPath(null)}
+                    onIngest={handleIngestOne}
+                    onLinkRepair={setLinkRepairTarget}
+                    onForceReingest={handleReingestOne}
+                    onCleanReingest={handleCleanReingestOne}
+                  />
                 )}
               </div>
             )
@@ -470,6 +511,15 @@ function RawSourcesSection() {
         open={showBatchDialog}
         onClose={() => setShowBatchDialog(false)}
       />
+
+      {linkRepairTarget && (
+        <LinkRepairDialog
+          open={!!linkRepairTarget}
+          onClose={() => setLinkRepairTarget(null)}
+          sourcePath={linkRepairTarget.path}
+          sourceName={linkRepairTarget.name}
+        />
+      )}
 
       {showReingestConfirm && (
         <div

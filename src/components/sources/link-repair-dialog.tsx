@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { Link2, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath } from "@/lib/path-utils"
 import { normalizeFileOverride } from "@/lib/ingest-strategy-resolver"
@@ -24,14 +23,21 @@ interface Props {
   sourceName: string
 }
 
-const MODES: LinkRepairMode[] = ["hub", "hierarchy", "custom"]
+const MODES: LinkRepairMode[] = ["h1-index", "hub", "hierarchy", "custom"]
+
+const TAB_I18N_KEYS: Record<LinkRepairMode, string> = {
+  "h1-index": "linkRepairTabH1Index",
+  hub: "linkRepairTabHub",
+  hierarchy: "linkRepairTabHierarchy",
+  custom: "linkRepairTabCustom",
+}
 
 export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Props) {
   const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const ingestStrategyConfig = useWikiStore((s) => s.ingestStrategyConfig)
 
-  const [mode, setMode] = useState<LinkRepairMode>("hub")
+  const [mode, setMode] = useState<LinkRepairMode>("h1-index")
   const [loading, setLoading] = useState(false)
   const [applying, setApplying] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -44,6 +50,7 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
     Array<{ slug: string; title: string; relativePath: string }>
   >([])
   const [applyResult, setApplyResult] = useState<{ modified: number; backupDir: string } | null>(null)
+  const [showAllItems, setShowAllItems] = useState(false)
 
   const fileOverride = useMemo(
     () => normalizeFileOverride(ingestStrategyConfig.fileOverrides?.[sourceName]),
@@ -53,11 +60,11 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
   const slugMode = fileOverride?.slugMode ?? "default"
   const slugNamespace = fileOverride?.slugNamespace ?? ""
 
-  const refreshPlan = useCallback(async () => {
+  const refreshPlan = useCallback(async (options?: { keepApplyResult?: boolean }) => {
     if (!project || !open) return
     setLoading(true)
     setError(null)
-    setApplyResult(null)
+    if (!options?.keepApplyResult) setApplyResult(null)
     try {
       const pages = await findEncyclopediaPagesForSource(project.path, sourcePath)
       setPageCount(pages.length)
@@ -91,7 +98,7 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
 
   useEffect(() => {
     if (!open) {
-      setMode("hub")
+      setMode("h1-index")
       setPlan(null)
       setSelectedPaths(new Set())
       setError(null)
@@ -99,6 +106,7 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
       setTargetQuery("")
       setTargetSlug("")
       setTargetSuggestions([])
+      setShowAllItems(false)
       return
     }
     void refreshPlan()
@@ -126,15 +134,30 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
 
   const selectAll = () => {
     if (!plan) return
-    setSelectedPaths(new Set(plan.items.map((item) => item.relativePath)))
+    setSelectedPaths(new Set(
+      plan.items.filter((item) => item.newContent).map((item) => item.relativePath),
+    ))
   }
 
   const selectUnlinked = () => {
     if (!plan) return
     setSelectedPaths(new Set(
-      plan.items.filter((item) => !item.alreadyLinked).map((item) => item.relativePath),
+      plan.items
+        .filter((item) => !item.alreadyLinked && item.newContent)
+        .map((item) => item.relativePath),
     ))
   }
+
+  const actionableCount = useMemo(
+    () => plan?.items.filter((item) => item.newContent).length ?? 0,
+    [plan],
+  )
+
+  const visibleItems = useMemo(() => {
+    if (!plan) return []
+    if (showAllItems) return plan.items
+    return plan.items.filter((item) => item.newContent)
+  }, [plan, showAllItems])
 
   const pagesToModify = useMemo(() => {
     if (!plan) return 0
@@ -169,7 +192,7 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
       const result = await applyLinkRepair(project.path, planWithSelection, originals)
       setApplyResult({ modified: result.modified, backupDir: result.backupDir })
       await refreshProjectFileTree(normalizePath(project.path), { bumpDataVersion: true })
-      await refreshPlan()
+      await refreshPlan({ keepApplyResult: true })
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -185,7 +208,7 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
       onClick={onClose}
     >
       <div
-        className="flex max-h-[85vh] w-[760px] flex-col rounded-lg border border-border bg-background shadow-lg"
+        className="flex h-[85vh] w-[760px] flex-col overflow-hidden rounded-lg border border-border bg-background shadow-lg"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b px-5 py-3">
@@ -210,7 +233,7 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
               className={`rounded px-3 py-1 text-xs ${mode === tab ? "bg-primary text-primary-foreground" : "hover:bg-accent"}`}
               onClick={() => setMode(tab)}
             >
-              {t(`sources.linkRepairTab${tab.charAt(0).toUpperCase()}${tab.slice(1)}`)}
+              {t(`sources.${TAB_I18N_KEYS[tab]}`)}
             </button>
           ))}
         </div>
@@ -253,22 +276,51 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
         )}
 
         {mode === "hub" && plan?.hubSlug && (
-          <div className="border-b px-5 py-2 text-xs text-muted-foreground">
+          <div className="shrink-0 border-b px-5 py-2 text-xs text-muted-foreground">
             {t("sources.linkRepairHubSlug", { slug: plan.hubSlug })}
+            {plan.resolvedSlugMode && plan.resolvedSlugMode !== slugMode && (
+              <span className="ml-2">
+                · {t("sources.linkRepairResolvedSlugMode", { mode: plan.resolvedSlugMode })}
+              </span>
+            )}
           </div>
         )}
 
-        <div className="flex flex-wrap items-center gap-2 border-b px-5 py-2 text-xs">
+        {mode === "hierarchy" && plan?.resolvedSlugMode && plan.resolvedSlugMode !== slugMode && (
+          <div className="shrink-0 border-b px-5 py-2 text-xs text-muted-foreground">
+            {t("sources.linkRepairResolvedSlugMode", { mode: plan.resolvedSlugMode })}
+          </div>
+        )}
+
+        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b px-5 py-2 text-xs">
           <button type="button" className="rounded border px-2 py-0.5 hover:bg-accent" onClick={selectAll}>
             {t("sources.linkRepairSelectAll")}
           </button>
           <button type="button" className="rounded border px-2 py-0.5 hover:bg-accent" onClick={selectUnlinked}>
             {t("sources.linkRepairSelectUnlinked")}
           </button>
+          {plan && plan.items.length > 0 && (
+            <span className="text-muted-foreground">
+              {t("sources.linkRepairActionableCount", {
+                actionable: actionableCount,
+                total: plan.items.length,
+              })}
+            </span>
+          )}
+          {plan && actionableCount < plan.items.length && (
+            <button
+              type="button"
+              className="rounded border px-2 py-0.5 hover:bg-accent"
+              onClick={() => setShowAllItems((prev) => !prev)}
+            >
+              {showAllItems
+                ? t("sources.linkRepairShowActionableOnly")
+                : t("sources.linkRepairShowAll")}
+            </button>
+          )}
         </div>
 
-        <ScrollArea className="min-h-0 flex-1">
-          <div className="px-5 py-2">
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-2">
             {loading && (
               <p className="py-8 text-center text-sm text-muted-foreground">
                 {t("sources.linkRepairPlanning")}
@@ -282,9 +334,14 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
                 {t("sources.linkRepairNoPages")}
               </p>
             )}
-            {!loading && plan && plan.items.length > 0 && (
+            {!loading && plan && visibleItems.length === 0 && actionableCount === 0 && (
+              <p className="py-8 text-center text-sm text-muted-foreground">
+                {t("sources.linkRepairNoChanges")}
+              </p>
+            )}
+            {!loading && plan && visibleItems.length > 0 && (
               <div className="space-y-1">
-                {plan.items.map((item) => (
+                {visibleItems.map((item) => (
                   <label
                     key={item.relativePath}
                     className="flex items-center gap-2 border-b border-border/50 py-1.5 text-sm last:border-0"
@@ -303,16 +360,19 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
                         ? t("sources.linkRepairAlreadyLinked")
                         : item.newContent
                           ? t("sources.linkRepairWillLink", { target: item.targetSlug })
-                          : t("sources.linkRepairNoChange")}
+                          : item.skipReason === "missing-parent-page"
+                            ? t("sources.linkRepairMissingParentPage")
+                            : item.skipReason === "h1-exists"
+                              ? t("sources.linkRepairH1Exists")
+                              : t("sources.linkRepairNoChange")}
                     </span>
                   </label>
                 ))}
               </div>
             )}
-          </div>
-        </ScrollArea>
+        </div>
 
-        <div className="space-y-2 border-t px-5 py-3">
+        <div className="shrink-0 space-y-2 border-t bg-background px-5 py-3">
           {previewLines.length > 0 && (
             <div className="rounded border bg-muted/30 px-3 py-2 text-xs">
               <p className="font-medium">{t("sources.linkRepairPreview", { count: pagesToModify })}</p>
@@ -324,11 +384,14 @@ export function LinkRepairDialog({ open, onClose, sourcePath, sourceName }: Prop
             </div>
           )}
           {applyResult && (
-            <p className="text-xs text-muted-foreground">
-              {t("sources.linkRepairDone", { count: applyResult.modified })}
-              {" · "}
-              {t("sources.linkRepairBackupPath", { path: applyResult.backupDir })}
-            </p>
+            <div className="rounded border border-green-500/30 bg-green-500/10 px-3 py-2 text-xs">
+              <p className="font-medium text-foreground">
+                {t("sources.linkRepairDone", { count: applyResult.modified })}
+              </p>
+              <p className="mt-1 text-muted-foreground">
+                {t("sources.linkRepairBackupPath", { path: applyResult.backupDir })}
+              </p>
+            </div>
           )}
           <div className="flex justify-end gap-2">
             <Button variant="outline" onClick={onClose} disabled={applying}>

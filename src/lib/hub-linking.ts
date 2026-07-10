@@ -1,12 +1,23 @@
 import { fileExists, readFile, writeFile } from "@/commands/fs"
 import { classifyHeadings, computeEntrySlugs } from "@/lib/heading-parser"
+import { parseFrontmatter } from "@/lib/frontmatter"
 import {
   appendWikilink,
+  appendWikilinks,
   lintLinkTarget,
   mergeSubEntriesSection,
 } from "@/lib/lint-fixes"
 import { normalizePath } from "@/lib/path-utils"
 import type { HeadingNode, SlugMode } from "@/types/ingest"
+
+const SLUG_MODE_INFERENCE_ORDER: SlugMode[] = [
+  "doc-h1-leaf",
+  "doc-h1-h2-leaf",
+  "title-concept",
+  "full-hierarchy",
+  "default",
+  "manual",
+]
 
 export interface RelatePageResult {
   content: string
@@ -70,11 +81,65 @@ export async function resolveWikiPathForSlug(
 
   const pp = normalizePath(projectPath)
   const target = lintLinkTarget(slug)
-  for (const folder of ["concepts", "entities"] as const) {
+  for (const folder of ["concepts", "entities", "sources"] as const) {
     const rel = `wiki/${folder}/${target}.md`
     if (await fileExists(`${pp}/${rel}`)) return rel
   }
   return null
+}
+
+async function resolveExistingLinkTargets(
+  projectPath: string,
+  slugs: string[],
+  writtenPaths: string[],
+): Promise<string[]> {
+  const resolved: string[] = []
+  const seen = new Set<string>()
+  for (const rawSlug of slugs) {
+    const slug = lintLinkTarget(rawSlug)
+    if (!slug) continue
+    const key = slug.toLowerCase()
+    if (seen.has(key)) continue
+    const path = await resolveWikiPathForSlug(projectPath, slug, writtenPaths)
+    if (!path) continue
+    seen.add(key)
+    resolved.push(slug)
+  }
+  return resolved
+}
+
+async function hierarchyLinkTargetsForPage(
+  projectPath: string,
+  writtenPaths: string[],
+  parsed: ReturnType<typeof parseFrontmatter>,
+  entry: HeadingNode | undefined,
+  entries: HeadingNode[],
+  entrySlugs: Map<string, string>,
+): Promise<string[]> {
+  const candidates: string[] = []
+  const seen = new Set<string>()
+  const addCandidate = (value: unknown) => {
+    const slug = frontmatterSlug(value)
+    if (!slug) return
+    const key = slug.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    candidates.push(slug)
+  }
+
+  if (entry) {
+    const treeParent = parentSlugForEntry(entry, entries, entrySlugs)
+    if (treeParent) addCandidate(treeParent)
+  }
+  addCandidate(parsed.frontmatter?.parent)
+  addCandidate(parsed.frontmatter?.ancestor)
+
+  return resolveExistingLinkTargets(projectPath, candidates, writtenPaths)
+}
+
+export function relatePageToTargets(content: string, targetSlugs: string[]): RelatePageResult {
+  const next = appendWikilinks(content, targetSlugs)
+  return { content: next, changed: next !== content }
 }
 
 export function buildEntrySlugMap(
@@ -84,6 +149,53 @@ export function buildEntrySlugMap(
   slugNamespace = "",
 ): Map<string, string> {
   return computeEntrySlugs(entries, slugMode, documentName, slugNamespace)
+}
+
+/** Pick the slug mode that best matches already-written wiki pages. */
+export function inferSlugModeForEntries(
+  entries: HeadingNode[],
+  documentName: string,
+  writtenPaths: string[],
+  slugNamespace = "",
+  preferredMode: SlugMode = "default",
+): SlugMode {
+  const wikiSlugs = new Set(
+    writtenPaths
+      .map((path) => slugFromWikiEntryPath(path))
+      .filter((slug): slug is string => slug !== null)
+      .map((slug) => slug.toLowerCase()),
+  )
+  if (wikiSlugs.size === 0 || entries.length === 0) return preferredMode
+
+  const modes = preferredMode !== "default"
+    ? [preferredMode, ...SLUG_MODE_INFERENCE_ORDER.filter((mode) => mode !== preferredMode)]
+    : SLUG_MODE_INFERENCE_ORDER
+
+  let best: { mode: SlugMode; score: number } = { mode: preferredMode, score: 0 }
+  for (const mode of modes) {
+    const slugs = computeEntrySlugs(entries, mode, documentName, slugNamespace)
+    let score = 0
+    for (const slug of slugs.values()) {
+      if (wikiSlugs.has(slug.toLowerCase())) score++
+    }
+    if (score > best.score) best = { mode, score }
+  }
+  return best.score > 0 ? best.mode : preferredMode
+}
+
+function pathKeyFromHeadingPath(value: unknown): string | null {
+  if (!Array.isArray(value) || value.length === 0) return null
+  const parts = value
+    .map((part) => (typeof part === "string" ? part.trim().toLowerCase() : ""))
+    .filter(Boolean)
+  return parts.length > 0 ? parts.join(" > ") : null
+}
+
+function frontmatterSlug(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed === "null" || trimmed === "None") return null
+  return trimmed
 }
 
 export function buildChildrenSlugMap(
@@ -231,27 +343,42 @@ export async function computeStructuralLinkChanges(
     for (const relativePath of entryPaths) {
       const slug = slugFromWikiEntryPath(relativePath)
       if (!slug) continue
-      const pathKey = slugToPathKey.get(slug.toLowerCase())
-      if (!pathKey) continue
-      const entry = entries.find((candidate) => candidate.pathKey === pathKey)
-      if (!entry) continue
 
       const original = await loadContent(relativePath)
-      let content = original
+      const parsed = parseFrontmatter(original)
+      const pathKey = slugToPathKey.get(slug.toLowerCase())
+        ?? pathKeyFromHeadingPath(parsed.frontmatter?.heading_path)
+      const entry = pathKey
+        ? entries.find((candidate) => candidate.pathKey === pathKey)
+        : undefined
 
-      const parentSlug = parentSlugForEntry(entry, entries, entrySlugs)
-      if (parentSlug) {
-        const parentPath = await resolveWikiPathForSlug(pp, parentSlug, opts.writtenPaths)
-        if (parentPath) {
-          const related = relatePageToTarget(content, parentSlug)
-          if (related.changed) {
-            parentLinksAdded += 1
-            content = related.content
-          }
+      const targets = await hierarchyLinkTargetsForPage(
+        pp,
+        opts.writtenPaths,
+        parsed,
+        entry,
+        entries,
+        entrySlugs,
+      )
+      if (targets.length > 0) {
+        const related = relatePageToTargets(original, targets)
+        if (related.changed) {
+          parentLinksAdded += targets.length
+          stageWrite(relativePath, related.content, original)
         }
       }
+    }
 
-      stageWrite(relativePath, content, original)
+    const childrenByParentSlug = new Map<string, string[]>()
+    for (const relativePath of entryPaths) {
+      const slug = slugFromWikiEntryPath(relativePath)
+      if (!slug) continue
+      const original = await loadContent(relativePath)
+      const parentSlug = frontmatterSlug(parseFrontmatter(original).frontmatter?.parent)
+      if (!parentSlug) continue
+      const existing = childrenByParentSlug.get(parentSlug.toLowerCase()) ?? []
+      existing.push(slug)
+      childrenByParentSlug.set(parentSlug.toLowerCase(), existing)
     }
 
     for (const [parentPathKey, childSlugs] of childrenMap) {
@@ -270,6 +397,29 @@ export async function computeStructuralLinkChanges(
         )
       ).filter((childSlug): childSlug is string => childSlug !== null)
 
+      if (validChildren.length === 0) continue
+
+      const original = await loadContent(parentRelPath)
+      const merged = mergeSubEntriesSection(original, validChildren)
+      if (merged !== original) {
+        subEntrySectionsUpdated += 1
+        stageWrite(parentRelPath, merged, original)
+      }
+    }
+
+    for (const [parentSlugKey, childSlugs] of childrenByParentSlug) {
+      const parentRelPath = pathBySlug.get(parentSlugKey)
+        ?? await resolveWikiPathForSlug(pp, parentSlugKey, opts.writtenPaths)
+      if (!parentRelPath) continue
+
+      const validChildren = (
+        await Promise.all(
+          childSlugs.map(async (childSlug) => {
+            const childPath = await resolveWikiPathForSlug(pp, childSlug, opts.writtenPaths)
+            return childPath ? childSlug : null
+          }),
+        )
+      ).filter((childSlug): childSlug is string => childSlug !== null)
       if (validChildren.length === 0) continue
 
       const original = await loadContent(parentRelPath)

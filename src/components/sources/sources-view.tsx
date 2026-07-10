@@ -1,6 +1,16 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, RotateCw, RefreshCcw, Link2 } from "lucide-react"
+import {
+  Plus,
+  FileText,
+  RefreshCw,
+  Trash2,
+  Folder,
+  ChevronRight,
+  ChevronDown,
+  RotateCw,
+  RefreshCcw,
+} from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
@@ -23,6 +33,7 @@ import {
 } from "@/lib/source-lifecycle"
 import { BatchIngestDialog } from "./batch-ingest-dialog"
 import { LinkRepairDialog } from "./link-repair-dialog"
+import { SourceFileActionsMenu } from "./source-file-actions-menu"
 import { filterRawSourceTree } from "@/lib/source-filter"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 
@@ -365,7 +376,6 @@ export function SourcesView() {
           </Button>
         </div>
       </div>
-      </div>
 
       <ScrollArea className="min-h-0 flex-1 overflow-hidden">
         {refreshError && (
@@ -544,6 +554,7 @@ export function SourcesView() {
           </div>
         </div>
       )}
+      </div>
     </TooltipProvider>
   )
 }
@@ -619,6 +630,7 @@ function SourceTree({
 }) {
   const { t } = useTranslation()
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+  const [openActionsPath, setOpenActionsPath] = useState<string | null>(null)
   const [visibleLimit, setVisibleLimit] = useState(SOURCE_TREE_INITIAL_ROWS)
   const loadMoreRef = useRef<HTMLDivElement | null>(null)
   const rows = useMemo(() => flattenVisibleRows(nodes, collapsed), [nodes, collapsed])
@@ -628,6 +640,13 @@ function SourceTree({
   useEffect(() => {
     setVisibleLimit(SOURCE_TREE_INITIAL_ROWS)
   }, [nodes])
+
+  useEffect(() => {
+    if (!openActionsPath) return
+    const close = () => setOpenActionsPath(null)
+    document.addEventListener("pointerdown", close)
+    return () => document.removeEventListener("pointerdown", close)
+  }, [openActionsPath])
 
   useEffect(() => {
     if (!hasMore) return
@@ -714,64 +733,41 @@ function SourceTree({
         return (
           <div
             key={node.path}
-            className="flex w-full items-center gap-1 rounded-md px-1 py-1 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+            className="group flex w-full min-w-0 items-center gap-1 rounded-md px-1 py-1 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
             style={{ paddingLeft: `${depth * 16 + 4}px` }}
           >
             <button
               onClick={() => onOpen(node)}
-              className="flex flex-1 items-center gap-2 truncate px-2 py-1 text-left"
+              className="flex min-w-0 flex-1 items-center gap-2 truncate px-2 py-1 text-left"
             >
               <FileText className="h-4 w-4 shrink-0" />
               <span className="truncate">{node.name}</span>
             </button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
-              title={t("sources.ingest")}
-              disabled={ingestingPath === node.path}
-              onClick={() => onIngest(node)}
-            >
-              <BookOpen className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
-              title={t("sources.linkRepairButton")}
-              onClick={() => onLinkRepair(node)}
-            >
-              <Link2 className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
-              title={t("sources.forceReingest")}
-              disabled={ingestingPath === node.path}
-              onClick={() => onForceReingest(node)}
-            >
-              <RotateCw className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-7 w-7 shrink-0 text-muted-foreground/70 hover:text-primary hover:bg-accent"
-              title={t("sources.cleanReingest")}
-              disabled={ingestingPath === node.path}
-              onClick={() => onCleanReingest(node)}
-            >
-              <RefreshCcw className="h-4 w-4" />
-            </Button>
-            <DeleteButton
-              isPending={isPendingDelete}
-              onClick={() => handleDeleteClick(node)}
-              hint={
-                isPendingDelete
-                  ? t("sources.deleteFileConfirm", { name: node.name })
-                  : t("sources.deleteFile", { name: node.name })
-              }
-            />
+            <div className="flex shrink-0 items-center gap-0.5">
+              <SourceFileActionsMenu
+                node={node}
+                open={openActionsPath === node.path}
+                ingesting={ingestingPath === node.path}
+                onToggle={(event) => {
+                  event.stopPropagation()
+                  setOpenActionsPath((current) => (current === node.path ? null : node.path))
+                }}
+                onClose={() => setOpenActionsPath(null)}
+                onIngest={onIngest}
+                onLinkRepair={onLinkRepair}
+                onForceReingest={onForceReingest}
+                onCleanReingest={onCleanReingest}
+              />
+              <DeleteButton
+                isPending={isPendingDelete}
+                onClick={() => handleDeleteClick(node)}
+                hint={
+                  isPendingDelete
+                    ? t("sources.deleteFileConfirm", { name: node.name })
+                    : t("sources.deleteFile", { name: node.name })
+                }
+              />
+            </div>
           </div>
         )
       })}

@@ -49,6 +49,15 @@ export function appendWikilink(content: string, target: string): string {
   return `${content.trimEnd()}\n\n## Related\n${linkLine}\n`
 }
 
+/** Append multiple missing targets under ## Related (creates section if absent). */
+export function appendWikilinks(content: string, targets: string[]): string {
+  let next = content
+  for (const target of targets) {
+    next = appendWikilink(next, target)
+  }
+  return next
+}
+
 export function rewriteWikilinkTarget(
   content: string,
   brokenTarget: string,

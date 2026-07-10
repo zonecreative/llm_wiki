@@ -24,6 +24,7 @@ import {
   extractDisplayTitle,
 } from "@/lib/source-identity"
 import { applyEncyclopediaStructuralLinks, buildChildrenSlugMap, parentSlugForEntry } from "@/lib/hub-linking"
+import { applyH1IndexPages } from "@/lib/h1-index"
 import { parseSources, writeSources } from "@/lib/sources-merge"
 import { checkIngestCache, saveIngestCache, INGEST_PIPELINE_VERSION } from "@/lib/ingest-cache"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
@@ -2027,6 +2028,33 @@ async function autoIngestImpl(
       console.log(
         `[ingest:strategy] encyclopedia drift check OK: ${writtenSlugs.size}/${expectedEntries} entries (${Math.round(driftRatio * 100)}%)`,
       )
+    }
+
+    // H1 chapter index pages (hub per capitolo) before structural links.
+    if (!signal?.aborted && writtenPaths.length > 0) {
+      try {
+        const documentName = fileName.replace(/\.[^.]+$/, "")
+        const h1Result = await applyH1IndexPages({
+          projectPath: pp,
+          headingTree,
+          writtenPaths,
+          slugMode: fileSlugMode,
+          documentName,
+          slugNamespace: fileSlugNamespace,
+          sourceIdentity,
+          sourceSummarySlug,
+        })
+        if (h1Result.createdPaths.length > 0) {
+          writtenPaths = [...writtenPaths, ...h1Result.createdPaths]
+          console.log(
+            `[ingest:strategy] encyclopedia H1 indexes: ${h1Result.createdPaths.length} chapter page(s) created`,
+          )
+        }
+      } catch (err) {
+        const msg = `Encyclopedia H1 index creation failed: ${err instanceof Error ? err.message : String(err)}`
+        console.warn(`[ingest:strategy] ${msg}`)
+        writeWarnings.push(msg)
+      }
     }
 
     // Deterministic structural links (hub + parent/child) from heading tree.

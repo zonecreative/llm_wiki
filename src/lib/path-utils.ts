@@ -62,3 +62,28 @@ export function isAbsolutePath(p: string): boolean {
   if (p.startsWith("\\\\") || p.startsWith("//")) return true
   return false
 }
+
+/** Project-relative path even when absolute paths use a different prefix (symlinks). */
+export function projectRelativePath(filePath: string, projectPath: string): string {
+  const fp = normalizePath(filePath)
+  const pp = normalizePath(projectPath).replace(/\/+$/, "")
+  if (fp.startsWith(`${pp}/`)) return fp.slice(pp.length + 1)
+
+  const lower = fp.toLowerCase()
+  const wikiIdx = lower.indexOf("/wiki/")
+  if (wikiIdx >= 0) return fp.slice(wikiIdx + 1)
+
+  const rawIdx = lower.indexOf("/raw/sources/")
+  if (rawIdx >= 0) return fp.slice(rawIdx + 1)
+
+  return fp
+}
+
+/** Resolve a raw source path to an absolute path under the project. */
+export function resolveAbsoluteSourcePath(projectPath: string, sourcePath: string): string {
+  const sp = normalizePath(sourcePath)
+  const pp = normalizePath(projectPath).replace(/\/+$/, "")
+  if (isAbsolutePath(sp)) return sp
+  if (sp.startsWith("raw/sources/")) return `${pp}/${sp}`
+  return `${pp}/raw/sources/${sp}`
+}

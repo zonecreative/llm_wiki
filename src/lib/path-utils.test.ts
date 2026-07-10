@@ -6,6 +6,8 @@ import {
   getFileStem,
   getRelativePath,
   isAbsolutePath,
+  projectRelativePath,
+  resolveAbsoluteSourcePath,
 } from "./path-utils"
 
 describe("normalizePath", () => {
@@ -149,5 +151,42 @@ describe("isAbsolutePath", () => {
   it("rejects drive-letter WITHOUT a separator (ambiguous)", () => {
     // "C:foo" is a Windows drive-relative path, not absolute.
     expect(isAbsolutePath("C:foo")).toBe(false)
+  })
+})
+
+describe("projectRelativePath", () => {
+  it("strips the project prefix when paths match", () => {
+    expect(
+      projectRelativePath("/project/wiki/concepts/foo.md", "/project"),
+    ).toBe("wiki/concepts/foo.md")
+  })
+
+  it("anchors on /wiki/ when absolute paths use a different prefix", () => {
+    expect(
+      projectRelativePath(
+        "/private/var/project/wiki/concepts/foo.md",
+        "/Users/me/project",
+      ),
+    ).toBe("wiki/concepts/foo.md")
+  })
+
+  it("anchors on /raw/sources/ for source files", () => {
+    expect(
+      projectRelativePath(
+        "/private/var/project/raw/sources/Soeliok/foo.md",
+        "/Users/me/project",
+      ),
+    ).toBe("raw/sources/Soeliok/foo.md")
+  })
+})
+
+describe("resolveAbsoluteSourcePath", () => {
+  it("joins relative raw source paths to the project root", () => {
+    expect(
+      resolveAbsoluteSourcePath(
+        "/project",
+        "raw/sources/Soeliok/foo.md",
+      ),
+    ).toBe("/project/raw/sources/Soeliok/foo.md")
   })
 })

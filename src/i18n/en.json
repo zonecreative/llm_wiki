@@ -28,7 +28,8 @@
   },
   "sidebar": {
     "knowledge": "Knowledge",
-    "files": "Files"
+    "files": "Files",
+    "rawSources": "Raw Sources"
   },
   "research": {
     "title": "Deep Research",
@@ -140,9 +141,13 @@
     "batchMergeAllHint": "Keep existing wiki pages and merge new ingest output",
     "batchCleanFile": "Clean",
     "batchCleanFileHint": "Delete wiki pages generated from this source before re-ingesting",
+    "fileActionsMenu": "File actions (ingest, link repair, re-ingest)",
+    "forceReingestShort": "Force re-ingest",
+    "cleanReingestShort": "Clean re-ingest",
     "linkRepairButton": "Link repair (hub, hierarchy, or custom relations)",
     "linkRepairTitle": "Link Repair",
     "linkRepairPageCount": "{{count}} encyclopedia page(s) from this source",
+    "linkRepairTabH1Index": "H1 chapters",
     "linkRepairTabHub": "Document hub",
     "linkRepairTabHierarchy": "Hierarchy",
     "linkRepairTabCustom": "Custom target",
@@ -154,6 +159,7 @@
     "linkRepairSelectUnlinked": "Select unlinked only",
     "linkRepairPlanning": "Analyzing pages (dry-run)…",
     "linkRepairNoPages": "No encyclopedia wiki pages found for this source.",
+    "linkRepairNoChanges": "Pages were found, but every selected repair mode already matches the current content.",
     "linkRepairAlreadyLinked": "Already linked",
     "linkRepairWillLink": "→ [[{{target}}]]",
     "linkRepairNoChange": "No change needed",
@@ -161,7 +167,13 @@
     "linkRepairApply": "Apply with backup",
     "linkRepairApplying": "Applying…",
     "linkRepairDone": "Updated {{count}} page(s).",
-    "linkRepairBackupPath": "Backup: {{path}}"
+    "linkRepairBackupPath": "Backup: {{path}}",
+    "linkRepairActionableCount": "{{actionable}} to update · {{total}} total",
+    "linkRepairShowAll": "Show all pages",
+    "linkRepairShowActionableOnly": "Show pending only",
+    "linkRepairResolvedSlugMode": "Detected slug mode: {{mode}}",
+    "linkRepairMissingParentPage": "Parent page not in wiki",
+    "linkRepairH1Exists": "Chapter index already exists"
   },
   "chat": {
     "placeholder": "Ask about your wiki...",
