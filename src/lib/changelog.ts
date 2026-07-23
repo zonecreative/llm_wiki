@@ -26,6 +26,50 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.1",
+    date: "2026-07-10",
+    highlights: {
+      en: [
+        "Improved Agent context so selected files, Skills, project knowledge, and retrieval evidence remain available throughout a turn.",
+        "Expanded Hybrid Search with adaptive keyword, vector, and knowledge-graph retrieval, including graph-aware references and an interactive local graph preview.",
+        "Added Agent file activity with per-file change summaries, diffs, and guarded undo when the file has not changed again.",
+        "Improved generated output handling with consolidated output browsing, automatic previews, enlarged viewing, and support for common document, image, and web formats.",
+        "Added file history comparison and restore controls for recorded project file versions.",
+        "Improved Agent loop convergence by limiting duplicate retrieval, budgeting tool iterations, and producing a final answer before the retrieval budget is exhausted.",
+      ],
+      zh: [
+        "增强 Agent 上下文能力，选中的文件、Skill、项目知识和检索证据可在整轮执行中持续使用。",
+        "扩展 Hybrid Search：自适应融合关键词、向量与知识图谱召回，并新增图谱引用和可交互的局部知识图谱预览。",
+        "新增 Agent 文件修改记录，支持按文件查看变更摘要、Diff，以及在文件未被再次修改时安全撤销。",
+        "完善生成物体验：支持集中浏览、自动预览、放大查看，以及常见文档、图片和网页格式预览。",
+        "新增文件历史比较和恢复功能，可查看并恢复已记录的项目文件版本。",
+        "优化 Agent 工具循环：限制重复检索、控制工具调用预算，并在检索预算耗尽前主动生成最终回答。",
+      ],
+    },
+  },
+  {
+    version: "0.6.0",
+    date: "2026-07-08",
+    highlights: {
+      en: [
+        "Rebuilt Chat Agent on the Rust backend for more reliable tool execution, session handling, cancellation, permissions, and LLM streaming.",
+        "Added Agent tools and Skill workflows, including wiki/source/graph/web search, workspace file generation, shell execution, user input forms, skill discovery, and per-conversation skill selection.",
+        "Improved generated output handling with a dedicated output panel, previews, enlarged modal viewing, and quick access to the output folder.",
+        "Improved Chat and Skill UI with a dedicated Skill management entry, slash skill completion, Mermaid diagram rendering, and better conversation isolation.",
+        "Strengthened path sandboxing, workspace restrictions, command approval, hidden/sensitive file filtering, and Windows/Linux path compatibility.",
+        "Expanded test coverage across the Rust Agent, tools, skills, search providers, chat sessions, layout, and Mermaid rendering.",
+      ],
+      zh: [
+        "重构 Chat Agent 底座：核心逻辑迁移到 Rust 后端，提升工具执行、会话、取消、权限和 LLM 流式调用的稳定性。",
+        "新增 Agent 工具与 Skill 工作流：支持 Wiki/Source/Graph/Web 检索、workspace 文件生成、shell 执行、用户交互表单、Skill 发现和每会话 Skill 选择。",
+        "完善生成物体验：生成文件会独立展示，支持右侧生成物面板、预览、弹窗放大和快速打开输出目录。",
+        "优化 Chat 与 Skill UI：新增独立 Skill 管理入口、/skill 补全、Mermaid 图表渲染，并修复会话内容串扰问题。",
+        "增强安全与跨平台兼容：加强路径沙箱、workspace 限制、命令审批、隐藏/敏感文件过滤，以及 Windows/Linux 路径兼容。",
+        "补充 Rust Agent、工具调用、Skill、搜索 Provider、Chat 会话、布局和 Mermaid 渲染相关测试。",
+      ],
+    },
+  },
+  {
     version: "0.5.2",
     date: "2026-06-25",
     highlights: {

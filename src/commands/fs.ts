@@ -141,6 +141,23 @@ export async function getFileMd5(path: string): Promise<string> {
   return invoke<string>("get_file_md5", { path })
 }
 
+export interface FileHistoryEntry {
+  id: string
+  path: string
+  timestamp: number
+  author: string
+  tool: string
+  content: string
+}
+
+export async function listFileHistory(projectPath: string, filePath: string): Promise<FileHistoryEntry[]> {
+  return invoke<FileHistoryEntry[]>("list_file_history", { projectPath, filePath })
+}
+
+export async function restoreFileHistory(projectPath: string, filePath: string, entryId: string): Promise<string> {
+  return invoke<string>("restore_file_history", { projectPath, filePath, entryId })
+}
+
 function assertAbsoluteFsPath(operation: string, path: string): void {
   if (!isAbsolutePath(path)) {
     throw new Error(`${operation} requires an absolute path: ${path}`)
@@ -182,6 +199,10 @@ export async function openProject(path: string): Promise<WikiProject> {
 
 export async function openProjectFolder(path: string): Promise<void> {
   return invoke<void>("open_project_folder", { path })
+}
+
+export async function openPathInProject(projectPath: string, targetPath: string): Promise<void> {
+  return invoke<void>("open_path_in_project", { projectPath, targetPath })
 }
 
 export async function clipServerStatus(): Promise<string> {

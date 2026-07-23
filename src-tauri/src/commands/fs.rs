@@ -979,8 +979,14 @@ pub async fn write_file(path: String, contents: String) -> Result<(), String> {
                     .map_err(|e| format!("Failed to create parent dirs for '{}': {}", path, e))?;
             }
             file_sync::mark_app_write_path(p);
+            crate::commands::file_history::record_file_version(
+                p,
+                "baseline",
+                "before.ui.write_file",
+            );
             fs::write(&path, contents)
                 .map_err(|e| format!("Failed to write file '{}': {}", path, e))?;
+            crate::commands::file_history::record_file_version(p, "human", "ui.write_file");
             file_sync::mark_app_write_path(p);
             Ok(())
         })
@@ -1039,6 +1045,11 @@ pub async fn write_file_atomic(path: String, contents: String) -> Result<(), Str
 
             file_sync::mark_app_write_path(&tmp_path);
             file_sync::mark_app_write_path(p);
+            crate::commands::file_history::record_file_version(
+                p,
+                "baseline",
+                "before.ui.write_file_atomic",
+            );
             fs::write(&tmp_path, contents).map_err(|e| {
                 format!("Failed to write temp file '{}': {}", tmp_path.display(), e)
             })?;
@@ -1052,6 +1063,7 @@ pub async fn write_file_atomic(path: String, contents: String) -> Result<(), Str
                     e
                 )
             })?;
+            crate::commands::file_history::record_file_version(p, "human", "ui.write_file_atomic");
             file_sync::mark_app_write_path(p);
             Ok(())
         })
@@ -2087,7 +2099,10 @@ mod tests {
         let shallow = build_tree(&root, 0, 1, false).unwrap();
         let a = shallow.iter().find(|n| n.name == "a").unwrap();
         assert!(a.is_dir);
-        assert!(a.children.is_none(), "max_depth=1 must not load grandchildren");
+        assert!(
+            a.children.is_none(),
+            "max_depth=1 must not load grandchildren"
+        );
 
         let deeper = build_tree(&root, 0, 3, false).unwrap();
         let a = deeper.iter().find(|n| n.name == "a").unwrap();

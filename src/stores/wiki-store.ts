@@ -353,6 +353,12 @@ interface WikiState {
   previewContentPath: string | null
   externalPreview: ExternalPreview | null
   /**
+   * View that handed control to the full-width wiki preview. Closing the
+   * preview must return there instead of leaving an empty wiki surface.
+   * This is transient navigation state and must not be persisted.
+   */
+  previewReturnView: Exclude<WikiState["activeView"], "wiki"> | null
+  /**
    * One-shot scroll target for the markdown preview. When the user
    * clicks an image in search results and chooses "jump to source",
    * we set this to the image URL alongside `selectedFile`. The
@@ -367,7 +373,7 @@ interface WikiState {
    * one wiki-relative) still works.
    */
   pendingScrollImageSrc: string | null
-  activeView: "chat" | "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "settings"
+  activeView: "chat" | "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "skills" | "settings"
   llmConfig: LlmConfig
   /** Per-provider-preset stored overrides (API key, model, endpoint, …). */
   providerConfigs: ProviderConfigs
@@ -402,6 +408,7 @@ interface WikiState {
   setFileContent: (content: string) => void
   openPathInPreview: (path: string) => void
   openFileInPreview: (path: string, content: string) => void
+  closePreview: () => void
   setExternalPreview: (preview: ExternalPreview | null) => void
   setPendingScrollImageSrc: (src: string | null) => void
   setActiveView: (view: WikiState["activeView"]) => void
@@ -433,6 +440,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   fileContent: "",
   previewContentPath: null,
   externalPreview: null,
+  previewReturnView: null,
   pendingScrollImageSrc: null,
   activeView: "wiki",
   llmConfig: {
@@ -465,18 +473,36 @@ export const useWikiStore = create<WikiState>((set) => ({
     set({ selectedFile, previewContentPath: null, externalPreview: null }),
   setFileContent: (fileContent) => set({ fileContent }),
   openPathInPreview: (selectedFile) =>
-    set({ selectedFile, previewContentPath: null, externalPreview: null, activeView: "wiki" }),
+    set((state) => ({
+      selectedFile,
+      previewContentPath: null,
+      externalPreview: null,
+      activeView: "wiki",
+      previewReturnView:
+        state.activeView === "wiki" ? state.previewReturnView : state.activeView,
+    })),
   openFileInPreview: (selectedFile, fileContent) =>
-    set({
+    set((state) => ({
       selectedFile,
       fileContent,
       previewContentPath: selectedFile,
       externalPreview: null,
       activeView: "wiki",
-    }),
+      previewReturnView:
+        state.activeView === "wiki" ? state.previewReturnView : state.activeView,
+    })),
+  closePreview: () =>
+    set((state) => ({
+      selectedFile: null,
+      fileContent: "",
+      previewContentPath: null,
+      externalPreview: null,
+      activeView: state.previewReturnView ?? "wiki",
+      previewReturnView: null,
+    })),
   setExternalPreview: (externalPreview) => set({ externalPreview }),
   setPendingScrollImageSrc: (pendingScrollImageSrc) => set({ pendingScrollImageSrc }),
-  setActiveView: (activeView) => set({ activeView }),
+  setActiveView: (activeView) => set({ activeView, previewReturnView: null }),
   searchApiConfig: {
     provider: "none",
     apiKey: "",
