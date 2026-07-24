@@ -47,6 +47,7 @@ function typeConfig(type: string): { icon: typeof FileText; label: string; color
 }
 
 export function KnowledgeTree() {
+  const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const llmConfig = useWikiStore((s) => s.llmConfig)
   const selectedFile = useWikiStore((s) => s.selectedFile)
@@ -246,7 +247,7 @@ export function KnowledgeTree() {
 
         {sortedGroups.length === 0 && (
           <div className="px-2 py-4 text-center text-xs text-muted-foreground">
-            No wiki pages yet. Import sources to get started.
+            {t("sidebar.noWikiPages")}
           </div>
         )}
 
@@ -267,7 +268,9 @@ export function KnowledgeTree() {
                   <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 )}
                 <Icon className={`h-3.5 w-3.5 shrink-0 ${config.color}`} />
-                <span className="flex-1 text-left font-medium">{config.label}</span>
+                <span className="flex-1 text-left font-medium">
+                  {t(`sidebar.typeLabels.${type}`, { defaultValue: config.label })}
+                </span>
                 <span className="text-xs text-muted-foreground">{items.length}</span>
               </button>
 
