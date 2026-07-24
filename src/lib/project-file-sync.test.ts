@@ -313,9 +313,8 @@ describe("project file sync", () => {
     await vi.advanceTimersByTimeAsync(300)
 
     expect(mocks.moveIngestCacheEntry).not.toHaveBeenCalled()
-    expect(mocks.enqueueBatch).toHaveBeenCalledWith("A", [
-      { sourcePath: "raw/sources/c.md", folderContext: "" },
-    ])
+    expect(mocks.enqueueBatch).not.toHaveBeenCalled()
+    expect(useWikiStore.getState().pendingWatchIngest).toContain("raw/sources/c.md")
   })
 
   it("does not infer moves for tiny identical files", async () => {

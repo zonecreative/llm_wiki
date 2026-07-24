@@ -15,12 +15,12 @@ interface IngestActivityState {
 
 const stateByActivity = new Map<string, IngestActivityState>()
 
-function t(key: string, params?: Record<string, unknown>): string {
+function progressT(key: string, params?: Record<string, unknown>): string {
   return i18n.t(`ingestProgress.${key}`, params ?? {})
 }
 
 function strategyName(strategy: IngestStrategy): string {
-  return t(`strategy.${strategy}`)
+  return progressT(`strategy.${strategy}`)
 }
 
 function buildDetail(state: IngestActivityState): string {
@@ -62,27 +62,27 @@ export function addIngestWarning(activityId: string, warning: string): void {
 }
 
 export function ingestReadingSource(activityId: string): void {
-  setIngestStep(activityId, t("readingSource"))
+  setIngestStep(activityId, progressT("readingSource"))
 }
 
 export function ingestMineruParsing(activityId: string): void {
-  setIngestStep(activityId, t("mineruParsing"))
+  setIngestStep(activityId, progressT("mineruParsing"))
 }
 
 export function ingestMineruProgress(activityId: string, msg: string): void {
-  setIngestStep(activityId, t("mineruProgress", { msg }))
+  setIngestStep(activityId, progressT("mineruProgress", { msg }))
 }
 
 export function ingestMineruFallback(activityId: string, error: string): void {
-  setIngestStep(activityId, t("mineruFallback", { error }))
+  setIngestStep(activityId, progressT("mineruFallback", { error }))
 }
 
 export function ingestCancelledDetail(): string {
-  return t("cancelled")
+  return progressT("cancelled")
 }
 
 export function ingestExtractingImages(activityId: string): void {
-  setIngestStep(activityId, t("extractingImages"))
+  setIngestStep(activityId, progressT("extractingImages"))
 }
 
 export function ingestCaptioningImages(
@@ -91,26 +91,26 @@ export function ingestCaptioningImages(
   total?: number,
 ): void {
   if (done !== undefined && total !== undefined) {
-    setIngestStep(activityId, t("captioningProgress", { done, total }))
+    setIngestStep(activityId, progressT("captioningProgress", { done, total }))
   } else {
-    setIngestStep(activityId, t("captioningImages"))
+    setIngestStep(activityId, progressT("captioningImages"))
   }
 }
 
 export function ingestSkippedUnchanged(activityId: string, count: number): void {
-  setIngestStep(activityId, t("skippedUnchanged", { count }))
+  setIngestStep(activityId, progressT("skippedUnchanged", { count }))
 }
 
 export function ingestStep1(activityId: string, consolidating: boolean): void {
-  setIngestStep(activityId, t(consolidating ? "step1Consolidating" : "step1Analyzing"))
+  setIngestStep(activityId, progressT(consolidating ? "step1Consolidating" : "step1Analyzing"))
 }
 
 export function ingestStep2(activityId: string): void {
-  setIngestStep(activityId, t("step2Generating"))
+  setIngestStep(activityId, progressT("step2Generating"))
 }
 
 export function ingestWritingFiles(activityId: string): void {
-  setIngestStep(activityId, t("writingFiles"))
+  setIngestStep(activityId, progressT("writingFiles"))
 }
 
 export interface IngestPlanSummary {
@@ -138,28 +138,28 @@ function buildPlanSummary(params: IngestPlanSummary): string {
 
   if (strategy === "mixed" && mixedSections && mixedSections.length > 0) {
     const sections = mixedSections
-      .map((s) => t("mixedSectionLine", { title: s.headingTitle, strategy: strategyName(s.strategy) }))
+      .map((s) => progressT("mixedSectionLine", { title: s.headingTitle, strategy: strategyName(s.strategy) }))
       .join(", ")
-    return t("summaryMixed", { sections })
+    return progressT("summaryMixed", { sections })
   }
 
   if (strategy === "encyclopedia" && encyclopediaEntries > 0) {
     const batchHint =
       encyclopediaBatches > 1
-        ? t("batchHint", { batches: encyclopediaBatches })
+        ? progressT("batchHint", { batches: encyclopediaBatches })
         : ""
-    return t("summaryEncyclopedia", { entries: encyclopediaEntries, batchHint })
+    return progressT("summaryEncyclopedia", { entries: encyclopediaEntries, batchHint })
   }
 
   if (strategy === "tabular" && tabularRows > 0) {
-    return t("summaryTabular", { rows: tabularRows, batches: tabularBatches || 1 })
+    return progressT("summaryTabular", { rows: tabularRows, batches: tabularBatches || 1 })
   }
 
   if (strategy === "narrative" && narrativeChapters > 0) {
-    return t("summaryNarrative", { chapters: narrativeChapters })
+    return progressT("summaryNarrative", { chapters: narrativeChapters })
   }
 
-  return t("summaryFixed")
+  return progressT("summaryFixed")
 }
 
 /** Show resolved strategy and document shape (persists as header line). */
@@ -169,21 +169,21 @@ export function announceIngestPlan(activityId: string, params: IngestPlanSummary
 
   let plan: string
   if (params.source === "override") {
-    plan = t("planOverride", { strategy, summary })
+    plan = progressT("planOverride", { strategy, summary })
   } else if (params.source === "fallback" && params.confidence !== undefined) {
-    plan = t("planFallback", { pct: Math.round(params.confidence * 100) })
+    plan = progressT("planFallback", { pct: Math.round(params.confidence * 100) })
   } else if (
     params.confidence !== undefined &&
     params.confidence < 0.8 &&
     params.source === "classifier"
   ) {
-    plan = t("planLowConfidence", {
+    plan = progressT("planLowConfidence", {
       strategy,
       pct: Math.round(params.confidence * 100),
       summary,
     })
   } else {
-    plan = t("planIntro", { strategy, summary })
+    plan = progressT("planIntro", { strategy, summary })
   }
 
   const state = getState(activityId)
@@ -197,23 +197,23 @@ export function ingestEncBatchGenerate(
   total: number,
   entries: number,
 ): void {
-  setIngestStep(activityId, t("encBatchGenerate", { current, total, entries }))
+  setIngestStep(activityId, progressT("encBatchGenerate", { current, total, entries }))
 }
 
 export function ingestEncBatchWrite(activityId: string, current: number, total: number): void {
-  setIngestStep(activityId, t("encBatchWrite", { current, total }))
+  setIngestStep(activityId, progressT("encBatchWrite", { current, total }))
 }
 
 export function ingestEncResume(activityId: string, current: number, total: number): void {
-  setIngestStep(activityId, t("encResume", { current, total }))
+  setIngestStep(activityId, progressT("encResume", { current, total }))
 }
 
 export function ingestEncGapFill(activityId: string, count: number): void {
-  setIngestStep(activityId, t("encGapFill", { count }))
+  setIngestStep(activityId, progressT("encGapFill", { count }))
 }
 
 export function ingestEncAggregate(activityId: string): void {
-  setIngestStep(activityId, t("encAggregate"))
+  setIngestStep(activityId, progressT("encAggregate"))
 }
 
 export function ingestTabBatchGenerate(
@@ -222,19 +222,19 @@ export function ingestTabBatchGenerate(
   total: number,
   rows: number,
 ): void {
-  setIngestStep(activityId, t("tabBatchGenerate", { current, total, rows }))
+  setIngestStep(activityId, progressT("tabBatchGenerate", { current, total, rows }))
 }
 
 export function ingestTabBatchWrite(activityId: string, current: number, total: number): void {
-  setIngestStep(activityId, t("tabBatchWrite", { current, total }))
+  setIngestStep(activityId, progressT("tabBatchWrite", { current, total }))
 }
 
 export function ingestTabResume(activityId: string, current: number, total: number): void {
-  setIngestStep(activityId, t("tabResume", { current, total }))
+  setIngestStep(activityId, progressT("tabResume", { current, total }))
 }
 
 export function ingestTabAggregate(activityId: string): void {
-  setIngestStep(activityId, t("tabAggregate"))
+  setIngestStep(activityId, progressT("tabAggregate"))
 }
 
 export function ingestLongSourceResume(
@@ -242,7 +242,7 @@ export function ingestLongSourceResume(
   current: number,
   total: number,
 ): void {
-  setIngestStep(activityId, t("longSourceResume", { current, total }))
+  setIngestStep(activityId, progressT("longSourceResume", { current, total }))
 }
 
 export function ingestLongSourceChunk(
@@ -250,25 +250,25 @@ export function ingestLongSourceChunk(
   current: number,
   total: number,
 ): void {
-  setIngestStep(activityId, t("longSourceChunk", { current, total }))
+  setIngestStep(activityId, progressT("longSourceChunk", { current, total }))
 }
 
 export function ingestRepairAggregates(activityId: string, paths: string[]): void {
-  setIngestStep(activityId, t("repairAggregates", { paths: paths.join(", ") }))
+  setIngestStep(activityId, progressT("repairAggregates", { paths: paths.join(", ") }))
 }
 
 export function warnDrift(activityId: string, pct: number, missing: string[]): void {
   const preview = missing.slice(0, 5).join(", ")
   const suffix = missing.length > 5 ? ", ..." : ""
-  addIngestWarning(activityId, t("warningDrift", { pct, missing: preview + suffix }))
+  addIngestWarning(activityId, progressT("warningDrift", { pct, missing: preview + suffix }))
 }
 
 export function warnChapterPages(activityId: string, paths: string[]): void {
-  addIngestWarning(activityId, t("warningChapterPages", { paths: paths.join(", ") }))
+  addIngestWarning(activityId, progressT("warningChapterPages", { paths: paths.join(", ") }))
 }
 
 export function warnSourceHub(activityId: string, count: number, min: number): void {
-  addIngestWarning(activityId, t("warningSourceHub", { count, min }))
+  addIngestWarning(activityId, progressT("warningSourceHub", { count, min }))
 }
 
 /** Summarize parser/writer warnings for the done line and activity panel. */
@@ -278,12 +278,12 @@ export function ingestWriteWarnings(activityId: string, warnings: readonly strin
   const summary =
     warnings.length === 1
       ? warnings[0]
-      : t("writeWarningsSummary", {
+      : progressT("writeWarningsSummary", {
           count: warnings.length,
           preview: warnings.slice(0, 2).join(" · "),
           extraHint:
             warnings.length > 2
-              ? t("writeWarningsExtraHint", { extra: warnings.length - 2 })
+              ? progressT("writeWarningsExtraHint", { extra: warnings.length - 2 })
               : "",
         })
 
@@ -291,7 +291,7 @@ export function ingestWriteWarnings(activityId: string, warnings: readonly strin
     addIngestWarning(activityId, warning)
   }
   if (warnings.length > 3) {
-    addIngestWarning(activityId, t("writeWarningsMore", { count: warnings.length - 3 }))
+    addIngestWarning(activityId, progressT("writeWarningsMore", { count: warnings.length - 3 }))
   }
   return summary
 }
@@ -302,10 +302,10 @@ export function formatIngestDoneDetail(
   warningSummary?: string,
   activityId?: string,
 ): string {
-  if (filesWritten === 0) return t("noFilesGenerated")
-  let detail = t("doneFiles", { count: filesWritten })
-  if (reviewCount > 0) detail += t("doneReview", { count: reviewCount })
-  if (warningSummary) detail += t("doneWarningsLogged", { warnings: warningSummary })
+  if (filesWritten === 0) return progressT("noFilesGenerated")
+  let detail = progressT("doneFiles", { count: filesWritten })
+  if (reviewCount > 0) detail += progressT("doneReview", { count: reviewCount })
+  if (warningSummary) detail += progressT("doneWarningsLogged", { warnings: warningSummary })
   if (activityId) {
     const warnings = getState(activityId).warnings
     if (warnings.length > 0) {
@@ -320,8 +320,8 @@ export function ingestErrorDetail(
   error: string,
   batch?: number,
 ): string {
-  if (kind === "analysis") return t("analysisFailed", { error })
-  if (kind === "generation") return t("generationFailed", { error })
-  if (kind === "batch" && batch !== undefined) return t("batchFailed", { batch, error })
-  return t("chunkFailed", { error })
+  if (kind === "analysis") return progressT("analysisFailed", { error })
+  if (kind === "generation") return progressT("generationFailed", { error })
+  if (kind === "batch" && batch !== undefined) return progressT("batchFailed", { batch, error })
+  return progressT("chunkFailed", { error })
 }
